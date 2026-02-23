@@ -1,8 +1,6 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "app_web.py", "use": "@vercel/python" }
-  ],
+  "builds": [{ "src": "app_web.py", "use": "@vercel/python" }],
   "routes": [
     { "src": "/sw\\.js", "dest": "app_web.py" },
     { "src": "/manifest\\.webmanifest", "dest": "app_web.py" },
