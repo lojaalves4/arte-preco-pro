@@ -1,0 +1,13 @@
+{
+  "name": "Arte Preço Pro",
+  "short_name": "ArtePreço",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#DCE6D5",
+  "theme_color": "#4E6B3E",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
