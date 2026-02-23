@@ -18,11 +18,9 @@ def validar_chave_wrapper(chave: str, device_id: str):
         return False, "Sistema de licença não encontrado (core.license_core)."
 
     try:
-        # tenta versão nova (2 params)
         return validar_chave(chave, device_id)
     except TypeError:
         try:
-            # tenta versão antiga (1 param)
             return validar_chave(chave)
         except Exception as e:
             return False, f"Erro ao validar chave: {e}"
@@ -31,9 +29,6 @@ def validar_chave_wrapper(chave: str, device_id: str):
 
 
 def calcular_preco_local(custo_material: float, horas: float, valor_hora: float, despesas_extras: float, margem_percent: float):
-    """
-    Cálculo local (sem depender do core.pricing para evitar erro de assinatura).
-    """
     custo_base = float(custo_material) + (float(horas) * float(valor_hora)) + float(despesas_extras)
     margem = float(margem_percent) / 100.0
     preco_final = custo_base * (1.0 + margem)
@@ -41,7 +36,6 @@ def calcular_preco_local(custo_material: float, horas: float, valor_hora: float,
 
 
 def brl(v: float) -> str:
-    # Formata BRL simples (sem depender de locale do servidor)
     s = f"{v:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
@@ -191,6 +185,17 @@ HTML = """
     <div id="card_app" class="card hide">
       <div id="status" class="msg ok">✅ Ativado</div>
 
+      <label>Cliente</label>
+      <input id="cliente" placeholder="Nome do cliente">
+
+      <label>Contato</label>
+      <input id="contato" placeholder="WhatsApp / Telefone / E-mail">
+
+      <label>Endereço</label>
+      <input id="endereco" placeholder="Rua, número, bairro, cidade - UF">
+
+      <hr style="border:none;border-top:1px solid var(--stroke); margin:14px 0;">
+
       <label>Produto</label>
       <input id="produto" placeholder="Ex: Logo">
 
@@ -225,17 +230,11 @@ HTML = """
         <button class="btn2" id="btn_revalidar">Revalidar chave</button>
         <button class="btn2" id="btn_sair">Sair</button>
       </div>
-      <div class="muted" style="margin-top:10px; font-size:14px;">
-        Dica: “Sair” no celular volta para a tela de ativação (não fecha o navegador).
-      </div>
     </div>
 
   </div>
 
 <script>
-  // =========================================================
-  // Persistência local
-  // =========================================================
   function getDeviceId(){
     let id = localStorage.getItem("ap_device_id");
     if(!id){
@@ -245,31 +244,19 @@ HTML = """
     return id;
   }
 
-  function saveKey(k){
-    localStorage.setItem("ap_key", k);
-  }
-  function getKey(){
-    return localStorage.getItem("ap_key") || "";
-  }
-  function clearKey(){
-    localStorage.removeItem("ap_key");
-  }
+  function saveKey(k){ localStorage.setItem("ap_key", k); }
+  function getKey(){ return localStorage.getItem("ap_key") || ""; }
+  function clearKey(){ localStorage.removeItem("ap_key"); }
 
   function show(el){ el.classList.remove("hide"); }
   function hide(el){ el.classList.add("hide"); }
 
-  // =========================================================
-  // UI refs
-  // =========================================================
   const cardAtiv = document.getElementById("card_ativacao");
   const cardApp  = document.getElementById("card_app");
   const msgAtiv  = document.getElementById("msg_ativacao");
   const statusEl = document.getElementById("status");
   const chaveInp = document.getElementById("chave");
 
-  // =========================================================
-  // Ativação / validação
-  // =========================================================
   async function apiAtivar(chave){
     const device_id = getDeviceId();
     const r = await fetch("/api/ativar", {
@@ -296,7 +283,6 @@ HTML = """
     }
   }
 
-  // tenta auto-ativar (quando abre de novo)
   window.addEventListener("load", async ()=>{
     const k = getKey();
     if(k){
@@ -311,7 +297,6 @@ HTML = """
           return;
         }
       }catch(e){
-        // se der falha de rede, deixa o usuário tentar manualmente
         voltarParaAtivacao("Falha ao conectar. Tente novamente.");
       }
     }
@@ -366,16 +351,12 @@ HTML = """
   });
 
   document.getElementById("btn_sair").addEventListener("click", ()=>{
-    // “sair” aqui é apenas voltar para a ativação (PWA não fecha o navegador)
     voltarParaAtivacao("");
   });
 
-  // =========================================================
-  // Cálculo
-  // =========================================================
   function n(v){
     if(v === null || v === undefined) return 0;
-    const s = String(v).replace(".", "").replace(",", "."); // aceita 1.234,56
+    const s = String(v).replace(".", "").replace(",", ".");
     const x = parseFloat(s);
     return isNaN(x) ? 0 : x;
   }
@@ -396,9 +377,16 @@ HTML = """
       return;
     }
 
+    const cliente  = (document.getElementById("cliente").value || "").trim();
+    const contato  = (document.getElementById("contato").value || "").trim();
+    const endereco = (document.getElementById("endereco").value || "").trim();
+
     const d = {
       chave: k,
       device_id: getDeviceId(),
+      cliente,
+      contato,
+      endereco,
       produto: (document.getElementById("produto").value || "").trim(),
       custo_material: n(document.getElementById("custo_material").value),
       horas: n(document.getElementById("horas").value),
@@ -411,7 +399,6 @@ HTML = """
     try{
       const j = await apiCalcular(d);
       if(!j.ok){
-        // se falhou por licença, volta
         if(j.code === "LICENSE"){
           clearKey();
           voltarParaAtivacao(j.msg || "Chave inválida.");
@@ -423,6 +410,10 @@ HTML = """
 
       const out = document.getElementById("out");
       out.innerHTML = `
+        <div><b>Cliente:</b> ${j.cliente || "-"}</div>
+        <div><b>Contato:</b> ${j.contato || "-"}</div>
+        <div><b>Endereço:</b> ${j.endereco || "-"}</div>
+        <hr style="border:none;border-top:1px solid #eee; margin:10px 0;">
         <div><b>Produto:</b> ${j.produto || "-"}</div>
         <div><b>Custo Base:</b> ${j.custo_base_fmt || "-"}</div>
         <div class="big">Preço Final: ${j.preco_final_fmt || "-"}</div>
@@ -432,8 +423,10 @@ HTML = """
       show(out);
 
       document.getElementById("btn_pdf").addEventListener("click", ()=>{
-        // abre página pronta para imprimir/salvar como PDF
         const url = new URL(window.location.origin + "/pdf");
+        url.searchParams.set("cliente", j.cliente || "");
+        url.searchParams.set("contato", j.contato || "");
+        url.searchParams.set("endereco", j.endereco || "");
         url.searchParams.set("produto", j.produto || "");
         url.searchParams.set("custo_base", j.custo_base_fmt || "");
         url.searchParams.set("preco_final", j.preco_final_fmt || "");
@@ -480,10 +473,13 @@ def api_calcular():
     chave = (data.get("chave") or "").strip()
     device_id = (data.get("device_id") or "").strip() or "device_unknown"
 
-    # valida licença antes de calcular
     ok, msg = validar_chave_wrapper(chave, device_id)
     if not ok:
         return jsonify(ok=False, msg=str(msg), code="LICENSE")
+
+    cliente = (data.get("cliente") or "").strip()
+    contato = (data.get("contato") or "").strip()
+    endereco = (data.get("endereco") or "").strip()
 
     produto = (data.get("produto") or "").strip()
     custo_material = float(data.get("custo_material") or 0)
@@ -503,6 +499,9 @@ def api_calcular():
 
     return jsonify(
         ok=True,
+        cliente=cliente,
+        contato=contato,
+        endereco=endereco,
         produto=produto,
         custo_base=custo_base,
         custo_base_fmt=brl(custo_base),
@@ -514,7 +513,9 @@ def api_calcular():
 
 @app.get("/pdf")
 def pdf_view():
-    # Página pronta para imprimir e salvar em PDF (Android/Chrome -> Imprimir -> Salvar como PDF)
+    cliente = request.args.get("cliente", "")
+    contato = request.args.get("contato", "")
+    endereco = request.args.get("endereco", "")
     produto = request.args.get("produto", "")
     custo_base = request.args.get("custo_base", "")
     preco_final = request.args.get("preco_final", "")
@@ -529,31 +530,35 @@ def pdf_view():
       <title>Orçamento - Arte Preço Pro</title>
       <style>
         body{{font-family:Arial, sans-serif; padding:24px;}}
-        .box{{border:1px solid #ddd; border-radius:12px; padding:18px; max-width:520px;}}
+        .box{{border:1px solid #ddd; border-radius:12px; padding:18px; max-width:560px;}}
         h1{{margin:0 0 12px;}}
         .big{{font-size:34px; font-weight:900; margin:10px 0;}}
         .muted{{color:#555;}}
-        @media print {{
-          .noprint {{ display:none; }}
-        }}
+        .line{{border:none;border-top:1px solid #eee;margin:12px 0;}}
+        @media print {{ .noprint {{ display:none; }} }}
       </style>
     </head>
     <body>
       <div class="box">
         <h1>ORÇAMENTO</h1>
+
+        <div><b>Cliente:</b> {cliente or "-"}</div>
+        <div><b>Contato:</b> {contato or "-"}</div>
+        <div><b>Endereço:</b> {endereco or "-"}</div>
+
+        <hr class="line">
+
         <div><b>Produto:</b> {produto or "-"}</div>
         <div><b>Custo Base:</b> {custo_base or "-"}</div>
         <div class="big">Preço Final: {preco_final or "-"}</div>
         <div class="muted">Validade: {validade_dias} dia(s)</div>
+
         <div class="muted" style="margin-top:16px;">Gerado pelo Arte Preço Pro</div>
       </div>
+
       <div class="noprint" style="margin-top:16px;">
         <button onclick="window.print()">Imprimir / Salvar em PDF</button>
       </div>
-      <script>
-        // opcional: abrir direto a tela de impressão
-        // window.print();
-      </script>
     </body>
     </html>
     """
@@ -561,5 +566,4 @@ def pdf_view():
 
 
 if __name__ == "__main__":
-    # local
     app.run(host="0.0.0.0", port=5000, debug=True)
