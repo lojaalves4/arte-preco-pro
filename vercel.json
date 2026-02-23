@@ -4,7 +4,10 @@
     { "src": "app_web.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/static/(.*)", "dest": "/static/$1" },
+    { "src": "/sw\\.js", "dest": "app_web.py" },
+    { "src": "/manifest\\.webmanifest", "dest": "app_web.py" },
+    { "src": "/static/(.*)", "dest": "app_web.py" },
+    { "src": "/api/(.*)", "dest": "app_web.py" },
     { "src": "/(.*)", "dest": "app_web.py" }
   ]
 }
