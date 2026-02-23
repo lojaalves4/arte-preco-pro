@@ -1,375 +1,448 @@
-import os
 from flask import Flask, request, jsonify, render_template_string
 
-# Importa seu validador
-from core.license_core import validar_chave
+app = Flask(__name__)
 
-# Tenta importar cálculo do core, mas não depende dele
-try:
-    from core.pricing import calcular_preco  # opcional
-except Exception:
-    calcular_preco = None
+# =========================================================
+# Helpers (licença e preço)
+# =========================================================
 
-
-app = Flask(__name__, static_folder="static", static_url_path="/static")
-
-
-# ---------------------------
-# Utilitários
-# ---------------------------
-def _to_float(v):
+def validar_chave_wrapper(chave: str, device_id: str):
+    """
+    Compatível com versões diferentes do license_core.validar_chave:
+    - validar_chave(chave, device_id)
+    - validar_chave(chave)
+    """
     try:
-        if v is None:
-            return 0.0
-        if isinstance(v, str):
-            v = v.replace(".", "").replace(",", ".").strip()
-        return float(v)
+        from core.license_core import validar_chave  # type: ignore
     except Exception:
-        return 0.0
+        return False, "Sistema de licença não encontrado (core.license_core)."
+
+    try:
+        # tenta versão nova (2 params)
+        return validar_chave(chave, device_id)
+    except TypeError:
+        try:
+            # tenta versão antiga (1 param)
+            return validar_chave(chave)
+        except Exception as e:
+            return False, f"Erro ao validar chave: {e}"
+    except Exception as e:
+        return False, f"Erro ao validar chave: {e}"
 
 
-def _fmt_brl(valor: float) -> str:
-    s = f"{valor:,.2f}"
+def calcular_preco_local(custo_material: float, horas: float, valor_hora: float, despesas_extras: float, margem_percent: float):
+    """
+    Cálculo local (sem depender do core.pricing para evitar erro de assinatura).
+    """
+    custo_base = float(custo_material) + (float(horas) * float(valor_hora)) + float(despesas_extras)
+    margem = float(margem_percent) / 100.0
+    preco_final = custo_base * (1.0 + margem)
+    return custo_base, preco_final
+
+
+def brl(v: float) -> str:
+    # Formata BRL simples (sem depender de locale do servidor)
+    s = f"{v:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
 
 
-def _calcular_local(payload: dict) -> dict:
-    produto = (payload.get("produto") or "").strip()
-    custo_material = _to_float(payload.get("custo_material"))
-    horas = _to_float(payload.get("horas"))
-    valor_hora = _to_float(payload.get("valor_hora"))
-    despesas_extras = _to_float(payload.get("despesas_extras"))
-    margem_lucro = _to_float(payload.get("margem_lucro"))  # %
-    validade_dias = int(_to_float(payload.get("validade_dias") or 7))
+# =========================================================
+# UI (HTML)
+# =========================================================
 
-    custo_base = custo_material + (horas * valor_hora) + despesas_extras
-    preco_final = custo_base * (1.0 + (margem_lucro / 100.0))
-
-    return {
-        "produto": produto,
-        "custo_base": round(custo_base, 2),
-        "preco_final": round(preco_final, 2),
-        "custo_base_fmt": _fmt_brl(custo_base),
-        "preco_final_fmt": _fmt_brl(preco_final),
-        "validade_dias": validade_dias,
-        "fonte_calculo": "fallback_interno",
-    }
-
-
-def _normalizar_resultado(resultado: dict) -> dict:
-    if not isinstance(resultado, dict):
-        return {"resultado": str(resultado), "fonte_calculo": "core_pricing"}
-
-    # garante campos padrão e formatações
-    if "custo_base" in resultado and "custo_base_fmt" not in resultado:
-        resultado["custo_base_fmt"] = _fmt_brl(_to_float(resultado.get("custo_base")))
-    if "preco_final" in resultado and "preco_final_fmt" not in resultado:
-        resultado["preco_final_fmt"] = _fmt_brl(_to_float(resultado.get("preco_final")))
-    if "validade_dias" not in resultado:
-        resultado["validade_dias"] = 7
-    resultado.setdefault("fonte_calculo", "core_pricing")
-    return resultado
-
-
-# ---------------------------
-# ROTAS API
-# ---------------------------
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-
-@app.post("/api/ativar")
-def api_ativar():
-    data = request.get_json(silent=True) or {}
-    chave = (data.get("chave") or "").strip()
-
-    if not chave:
-        return jsonify({"ok": False, "msg": "Cole a chave AP-..."}), 400
-
-    ok, msg = validar_chave(chave)  # ✅ 1 parâmetro
-    return jsonify({"ok": bool(ok), "msg": msg})
-
-
-@app.post("/api/calcular")
-def api_calcular():
-    data = request.get_json(silent=True) or {}
-    chave = (data.get("chave") or "").strip()
-
-    if not chave:
-        return jsonify({"ok": False, "msg": "Chave não informada."}), 400
-
-    ok, msg = validar_chave(chave)
-    if not ok:
-        return jsonify({"ok": False, "msg": msg}), 403
-
-    # Tenta cálculo do core.pricing, mas se der QUALQUER erro, usa fallback
-    try:
-        if callable(calcular_preco):
-            try:
-                resultado = calcular_preco(
-                    produto=(data.get("produto") or "").strip(),
-                    custo_material=_to_float(data.get("custo_material")),
-                    horas=_to_float(data.get("horas")),
-                    valor_hora=_to_float(data.get("valor_hora")),
-                    despesas_extras=_to_float(data.get("despesas_extras")),
-                    margem_lucro=_to_float(data.get("margem_lucro")),
-                    validade_dias=int(_to_float(data.get("validade_dias") or 7)),
-                )
-                resultado = _normalizar_resultado(resultado)
-                return jsonify({"ok": True, "msg": "Cálculo concluído.", "data": resultado})
-            except Exception as e_core:
-                # cai para fallback, mas avisa o motivo
-                fb = _calcular_local(data)
-                fb["aviso"] = f"Core pricing falhou e usei fallback. Motivo: {e_core}"
-                return jsonify({"ok": True, "msg": "Cálculo concluído (fallback).", "data": fb})
-
-        # sem core.pricing -> fallback
-        fb = _calcular_local(data)
-        fb["aviso"] = "core.pricing não encontrado; usei cálculo interno."
-        return jsonify({"ok": True, "msg": "Cálculo concluído (fallback).", "data": fb})
-
-    except Exception as e:
-        return jsonify({"ok": False, "msg": f"Erro ao calcular: {e}"}), 500
-
-
-# ---------------------------
-# PÁGINA WEB (PWA)
-# ---------------------------
-HTML = r"""
+HTML = """
 <!doctype html>
 <html lang="pt-br">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Arte Preço Pro</title>
-
-  <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#4E6B3E">
-
   <style>
-    body { font-family: Arial, sans-serif; background: #DCE6D5; margin: 0; padding: 0; }
-    .wrap { max-width: 680px; margin: 0 auto; padding: 24px; }
-    .card { background: #E9F0E2; border-radius: 12px; padding: 18px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
-    h1 { margin: 0 0 14px 0; font-size: 34px; }
-    label { display:block; margin-top: 12px; font-weight: 700; }
-    input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #bbb; font-size: 16px; }
-    button { width: 100%; padding: 14px; margin-top: 16px; border-radius: 10px; border: 0; font-size: 18px; cursor:pointer; }
-    .btn { background: #4E6B3E; color: #fff; }
-    .btn2 { background: #6A6A6A; color: #fff; }
-    .msg { margin-top: 12px; padding: 12px; border-radius: 10px; background: #fff; border: 1px solid #d0d0d0; }
-    .ok { border-color: #2f8f2f; }
-    .err { border-color: #c73333; }
-    .row { display:flex; gap: 10px; }
-    .row > div { flex: 1; }
-    .big { font-size: 22px; font-weight: 900; margin-top: 12px; }
-    .muted { color:#333; opacity: .85; }
-    .small { font-size: 13px; opacity: .85; margin-top: 8px; }
+    :root{
+      --bg:#dfe8d6;
+      --card:#e7efe0;
+      --btn:#4d6b3a;
+      --btn2:#2f3b2b;
+      --txt:#101510;
+      --muted:#3b4a36;
+      --stroke:#b7c7ad;
+      --white:#ffffff;
+    }
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--txt);
+    }
+    .wrap{
+      max-width: 520px;
+      margin: 0 auto;
+      padding: 18px 14px 26px;
+    }
+    h1{
+      font-size: 40px;
+      margin: 12px 0 10px;
+      letter-spacing: -1px;
+    }
+    .card{
+      background: var(--card);
+      border: 1px solid var(--stroke);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 1px 0 rgba(0,0,0,.03);
+    }
+    label{
+      font-weight: 700;
+      display:block;
+      margin: 10px 0 6px;
+      font-size: 18px;
+    }
+    input{
+      width: 100%;
+      box-sizing: border-box;
+      padding: 12px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--stroke);
+      background: var(--white);
+      font-size: 18px;
+      outline: none;
+    }
+    .row{
+      display:flex;
+      gap: 10px;
+    }
+    .row > div{ flex:1; }
+    .btn{
+      width:100%;
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: none;
+      background: var(--btn);
+      color: white;
+      font-size: 20px;
+      font-weight: 800;
+      cursor:pointer;
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btn2{
+      width:100%;
+      margin-top: 10px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: none;
+      background: var(--btn2);
+      color: white;
+      font-size: 18px;
+      font-weight: 800;
+      cursor:pointer;
+    }
+    .msg{
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--stroke);
+      background: #ffffff;
+      font-weight: 700;
+    }
+    .ok{ color: #1b5e20; }
+    .bad{ color: #b71c1c; }
+    .muted{ color: var(--muted); font-weight: 600; }
+    .big{
+      font-size: 38px;
+      font-weight: 900;
+      margin: 8px 0 6px;
+    }
+    .result{
+      margin-top: 14px;
+      padding: 14px;
+      border-radius: 12px;
+      background: #fff;
+      border: 1px solid var(--stroke);
+    }
+    .actions{
+      display:flex;
+      gap:10px;
+      margin-top: 10px;
+    }
+    .actions button{ flex:1; }
+    .hide{ display:none; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <h1>Arte Preço Pro</h1>
+    <h1>Arte Preço Pro</h1>
 
-      <div id="box_ativacao">
-        <div class="muted">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
+    <!-- TELA ATIVAÇÃO -->
+    <div id="card_ativacao" class="card">
+      <h2 style="margin:0 0 6px;">Ativação do Arte Preço Pro</h2>
+      <div class="muted">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
 
-        <label>Chave</label>
-        <input id="inp_chave" placeholder="Cole sua chave AP-..." autocomplete="off"/>
+      <label for="chave">Chave</label>
+      <input id="chave" placeholder="Cole sua chave AP-..." autocomplete="off">
 
-        <button class="btn" id="btn_ativar">Ativar</button>
+      <button class="btn" id="btn_ativar">Ativar</button>
 
-        <div id="msg_ativar" class="msg" style="display:none;"></div>
-      </div>
-
-      <div id="box_app" style="display:none;">
-        <div id="status_ok" class="msg ok" style="display:none;"></div>
-
-        <label>Produto</label>
-        <input id="produto" placeholder="Ex: Banner / Logo / Cartão"/>
-
-        <label>Custo do Material (R$)</label>
-        <input id="custo_material" inputmode="decimal" placeholder="Ex: 12,50"/>
-
-        <div class="row">
-          <div>
-            <label>Horas Trabalhadas</label>
-            <input id="horas" inputmode="decimal" placeholder="Ex: 1,5"/>
-          </div>
-          <div>
-            <label>Valor da Hora (R$)</label>
-            <input id="valor_hora" inputmode="decimal" placeholder="Ex: 35"/>
-          </div>
-        </div>
-
-        <label>Despesas Extras (R$)</label>
-        <input id="despesas_extras" inputmode="decimal" placeholder="Ex: 5,00"/>
-
-        <label>Margem de Lucro (%)</label>
-        <input id="margem_lucro" inputmode="decimal" placeholder="Ex: 40"/>
-
-        <label>Validade (dias)</label>
-        <input id="validade_dias" inputmode="numeric" value="7"/>
-
-        <button class="btn" id="btn_calcular">Calcular</button>
-
-        <div id="resultado" class="msg" style="display:none;"></div>
-
-        <div class="row">
-          <div><button class="btn2" id="btn_sair">Sair</button></div>
-          <div><button class="btn" id="btn_revalidar">Revalidar chave</button></div>
-        </div>
-
-        <div id="msg_app" class="msg" style="display:none;"></div>
-      </div>
-
+      <div id="msg_ativacao" class="msg hide"></div>
     </div>
+
+    <!-- TELA APP -->
+    <div id="card_app" class="card hide">
+      <div id="status" class="msg ok">✅ Ativado</div>
+
+      <label>Produto</label>
+      <input id="produto" placeholder="Ex: Logo">
+
+      <label>Custo do Material (R$)</label>
+      <input id="custo_material" inputmode="decimal" placeholder="Ex: 10">
+
+      <div class="row">
+        <div>
+          <label>Horas Trabalhadas</label>
+          <input id="horas" inputmode="decimal" placeholder="Ex: 4">
+        </div>
+        <div>
+          <label>Valor da Hora (R$)</label>
+          <input id="valor_hora" inputmode="decimal" placeholder="Ex: 30">
+        </div>
+      </div>
+
+      <label>Despesas Extras (R$)</label>
+      <input id="despesas_extras" inputmode="decimal" placeholder="Ex: 2">
+
+      <label>Margem de Lucro (%)</label>
+      <input id="margem" inputmode="decimal" placeholder="Ex: 80">
+
+      <label>Validade (dias)</label>
+      <input id="validade" inputmode="numeric" value="7">
+
+      <button class="btn" id="btn_calcular">Calcular</button>
+
+      <div id="out" class="result hide"></div>
+
+      <div class="actions">
+        <button class="btn2" id="btn_revalidar">Revalidar chave</button>
+        <button class="btn2" id="btn_sair">Sair</button>
+      </div>
+      <div class="muted" style="margin-top:10px; font-size:14px;">
+        Dica: “Sair” no celular volta para a tela de ativação (não fecha o navegador).
+      </div>
+    </div>
+
   </div>
 
 <script>
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
+  // =========================================================
+  // Persistência local
+  // =========================================================
+  function getDeviceId(){
+    let id = localStorage.getItem("ap_device_id");
+    if(!id){
+      id = "dev_" + Math.random().toString(16).slice(2) + "_" + Date.now();
+      localStorage.setItem("ap_device_id", id);
+    }
+    return id;
   }
 
-  function showMsg(el, text, ok){
-    el.style.display = "block";
-    el.classList.remove("ok","err");
-    el.classList.add(ok ? "ok" : "err");
-    el.textContent = text;
+  function saveKey(k){
+    localStorage.setItem("ap_key", k);
+  }
+  function getKey(){
+    return localStorage.getItem("ap_key") || "";
+  }
+  function clearKey(){
+    localStorage.removeItem("ap_key");
   }
 
-  function getKey(){ return localStorage.getItem("AP_KEY") || ""; }
-  function setKey(k){ localStorage.setItem("AP_KEY", k); }
-  function clearKey(){ localStorage.removeItem("AP_KEY"); }
+  function show(el){ el.classList.remove("hide"); }
+  function hide(el){ el.classList.add("hide"); }
 
-  function showApp(msg){
-    document.getElementById("box_ativacao").style.display = "none";
-    document.getElementById("box_app").style.display = "block";
-    const st = document.getElementById("status_ok");
-    showMsg(st, msg || "✅ Ativado.", true);
-  }
+  // =========================================================
+  // UI refs
+  // =========================================================
+  const cardAtiv = document.getElementById("card_ativacao");
+  const cardApp  = document.getElementById("card_app");
+  const msgAtiv  = document.getElementById("msg_ativacao");
+  const statusEl = document.getElementById("status");
+  const chaveInp = document.getElementById("chave");
 
-  function showActivation(){
-    document.getElementById("box_ativacao").style.display = "block";
-    document.getElementById("box_app").style.display = "none";
-  }
-
-  async function postJSON(url, body){
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body || {})
+  // =========================================================
+  // Ativação / validação
+  // =========================================================
+  async function apiAtivar(chave){
+    const device_id = getDeviceId();
+    const r = await fetch("/api/ativar", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ chave, device_id })
     });
-    const j = await r.json().catch(()=>({ok:false,msg:"Resposta inválida"}));
-    return { status: r.status, data: j };
+    return await r.json();
   }
 
-  async function ativar(chave){
-    const msg = document.getElementById("msg_ativar");
-    const res = await postJSON("/api/ativar", { chave });
-    if(res.data.ok){
-      setKey(chave);
-      showApp(res.data.msg || "✅ Ativado.");
-      msg.style.display = "none";
-    } else {
-      showMsg(msg, res.data.msg || "Chave inválida.", false);
+  function entrarNoApp(textoStatus){
+    statusEl.textContent = textoStatus || "✅ Ativado";
+    hide(cardAtiv);
+    show(cardApp);
+  }
+
+  function voltarParaAtivacao(msg){
+    show(cardAtiv);
+    hide(cardApp);
+    if(msg){
+      msgAtiv.textContent = msg;
+      msgAtiv.className = "msg bad";
+      show(msgAtiv);
     }
   }
 
-  async function revalidar(){
-    const chave = getKey();
-    const msg = document.getElementById("msg_app");
-    if(!chave){ showActivation(); return; }
-
-    const res = await postJSON("/api/ativar", { chave });
-    if(res.data.ok){
-      showMsg(msg, res.data.msg || "✅ Chave ok.", true);
-    } else {
-      clearKey();
-      showActivation();
-      showMsg(document.getElementById("msg_ativar"), res.data.msg || "Chave inválida.", false);
+  // tenta auto-ativar (quando abre de novo)
+  window.addEventListener("load", async ()=>{
+    const k = getKey();
+    if(k){
+      try{
+        const j = await apiAtivar(k);
+        if(j.ok){
+          entrarNoApp("✅ " + (j.msg || "Ativado"));
+          return;
+        }else{
+          clearKey();
+          voltarParaAtivacao("Chave inválida. Cole novamente.");
+          return;
+        }
+      }catch(e){
+        // se der falha de rede, deixa o usuário tentar manualmente
+        voltarParaAtivacao("Falha ao conectar. Tente novamente.");
+      }
     }
-  }
-
-  async function calcular(){
-    const chave = getKey();
-    const out = document.getElementById("resultado");
-    const msg = document.getElementById("msg_app");
-
-    if(!chave){ showActivation(); return; }
-
-    const payload = {
-      chave: chave,
-      produto: document.getElementById("produto").value,
-      custo_material: document.getElementById("custo_material").value,
-      horas: document.getElementById("horas").value,
-      valor_hora: document.getElementById("valor_hora").value,
-      despesas_extras: document.getElementById("despesas_extras").value,
-      margem_lucro: document.getElementById("margem_lucro").value,
-      validade_dias: document.getElementById("validade_dias").value
-    };
-
-    const res = await postJSON("/api/calcular", payload);
-
-    if(res.data.ok){
-      const d = res.data.data || {};
-      out.style.display = "block";
-      out.classList.remove("err"); out.classList.add("ok");
-
-      const aviso = d.aviso ? `<div class="small">⚠️ ${d.aviso}</div>` : "";
-      const fonte = d.fonte_calculo ? `<div class="small">Fonte: ${d.fonte_calculo}</div>` : "";
-
-      out.innerHTML = `
-        <div><b>Produto:</b> ${d.produto || "-"}</div>
-        <div><b>Custo Base:</b> ${d.custo_base_fmt || d.custo_base || "-"}</div>
-        <div class="big">Preço Final: ${d.preco_final_fmt || d.preco_final || "-"}</div>
-        <div class="muted">Validade: ${d.validade_dias || 7} dia(s)</div>
-        ${fonte}
-        ${aviso}
-      `;
-      msg.style.display = "none";
-      return;
-    }
-
-    // erro
-    if(res.status === 403){
-      clearKey();
-      showActivation();
-      showMsg(document.getElementById("msg_ativar"), res.data.msg || "Chave inválida.", false);
-      return;
-    }
-
-    showMsg(msg, res.data.msg || "Erro ao calcular.", false);
-  }
-
-  document.getElementById("btn_ativar").addEventListener("click", ()=>{
-    const chave = document.getElementById("inp_chave").value.trim();
-    ativar(chave);
   });
 
-  document.getElementById("btn_calcular").addEventListener("click", calcular);
+  document.getElementById("btn_ativar").addEventListener("click", async ()=>{
+    const k = (chaveInp.value || "").trim();
+    if(!k){
+      msgAtiv.textContent = "Cole a chave.";
+      msgAtiv.className = "msg bad";
+      show(msgAtiv);
+      return;
+    }
+    try{
+      const j = await apiAtivar(k);
+      if(j.ok){
+        saveKey(k);
+        msgAtiv.textContent = "✅ " + (j.msg || "Ativado");
+        msgAtiv.className = "msg ok";
+        show(msgAtiv);
+        entrarNoApp("✅ " + (j.msg || "Ativado"));
+      }else{
+        msgAtiv.textContent = j.msg || "Chave inválida.";
+        msgAtiv.className = "msg bad";
+        show(msgAtiv);
+      }
+    }catch(e){
+      msgAtiv.textContent = "Erro ao ativar. Tente novamente.";
+      msgAtiv.className = "msg bad";
+      show(msgAtiv);
+    }
+  });
+
+  document.getElementById("btn_revalidar").addEventListener("click", async ()=>{
+    const k = getKey();
+    if(!k){
+      voltarParaAtivacao("Cole a chave novamente.");
+      return;
+    }
+    try{
+      const j = await apiAtivar(k);
+      if(j.ok){
+        statusEl.textContent = "✅ " + (j.msg || "Ativado");
+        alert("Chave OK ✅");
+      }else{
+        clearKey();
+        voltarParaAtivacao("Chave inválida. Cole novamente.");
+      }
+    }catch(e){
+      alert("Falha ao revalidar. Tente novamente.");
+    }
+  });
 
   document.getElementById("btn_sair").addEventListener("click", ()=>{
-    showActivation();
-    document.getElementById("inp_chave").value = getKey();
-    showMsg(document.getElementById("msg_ativar"), "Chave salva. Se quiser, clique Ativar novamente.", true);
+    // “sair” aqui é apenas voltar para a ativação (PWA não fecha o navegador)
+    voltarParaAtivacao("");
   });
 
-  document.getElementById("btn_revalidar").addEventListener("click", revalidar);
+  // =========================================================
+  // Cálculo
+  // =========================================================
+  function n(v){
+    if(v === null || v === undefined) return 0;
+    const s = String(v).replace(".", "").replace(",", "."); // aceita 1.234,56
+    const x = parseFloat(s);
+    return isNaN(x) ? 0 : x;
+  }
 
-  window.addEventListener("load", async ()=>{
-    const chave = getKey();
-    if(chave){
-      document.getElementById("inp_chave").value = chave;
-      const res = await postJSON("/api/ativar", { chave });
-      if(res.data.ok){
-        showApp("✅ Chave reconhecida. App liberado.");
-      } else {
-        clearKey();
-        showActivation();
+  async function apiCalcular(payload){
+    const r = await fetch("/api/calcular", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify(payload)
+    });
+    return await r.json();
+  }
+
+  document.getElementById("btn_calcular").addEventListener("click", async ()=>{
+    const k = getKey();
+    if(!k){
+      voltarParaAtivacao("Cole a chave para continuar.");
+      return;
+    }
+
+    const d = {
+      chave: k,
+      device_id: getDeviceId(),
+      produto: (document.getElementById("produto").value || "").trim(),
+      custo_material: n(document.getElementById("custo_material").value),
+      horas: n(document.getElementById("horas").value),
+      valor_hora: n(document.getElementById("valor_hora").value),
+      despesas_extras: n(document.getElementById("despesas_extras").value),
+      margem: n(document.getElementById("margem").value),
+      validade_dias: parseInt(document.getElementById("validade").value || "7", 10) || 7
+    };
+
+    try{
+      const j = await apiCalcular(d);
+      if(!j.ok){
+        // se falhou por licença, volta
+        if(j.code === "LICENSE"){
+          clearKey();
+          voltarParaAtivacao(j.msg || "Chave inválida.");
+          return;
+        }
+        alert(j.msg || "Erro ao calcular.");
+        return;
       }
+
+      const out = document.getElementById("out");
+      out.innerHTML = `
+        <div><b>Produto:</b> ${j.produto || "-"}</div>
+        <div><b>Custo Base:</b> ${j.custo_base_fmt || "-"}</div>
+        <div class="big">Preço Final: ${j.preco_final_fmt || "-"}</div>
+        <div class="muted">Validade: ${j.validade_dias || 7} dia(s)</div>
+        <button class="btn" id="btn_pdf">Gerar PDF</button>
+      `;
+      show(out);
+
+      document.getElementById("btn_pdf").addEventListener("click", ()=>{
+        // abre página pronta para imprimir/salvar como PDF
+        const url = new URL(window.location.origin + "/pdf");
+        url.searchParams.set("produto", j.produto || "");
+        url.searchParams.set("custo_base", j.custo_base_fmt || "");
+        url.searchParams.set("preco_final", j.preco_final_fmt || "");
+        url.searchParams.set("validade_dias", String(j.validade_dias || 7));
+        window.open(url.toString(), "_blank");
+      });
+
+    }catch(e){
+      alert("Erro ao calcular. Tente novamente.");
     }
   });
 </script>
@@ -378,11 +451,115 @@ HTML = r"""
 """
 
 
+# =========================================================
+# Routes
+# =========================================================
+
 @app.get("/")
-def index():
+def home():
     return render_template_string(HTML)
 
 
+@app.post("/api/ativar")
+def api_ativar():
+    data = request.get_json(silent=True) or {}
+    chave = (data.get("chave") or "").strip()
+    device_id = (data.get("device_id") or "").strip() or "device_unknown"
+
+    if not chave:
+        return jsonify(ok=False, msg="Cole a chave.", code="VALIDATION")
+
+    ok, msg = validar_chave_wrapper(chave, device_id)
+    return jsonify(ok=bool(ok), msg=str(msg))
+
+
+@app.post("/api/calcular")
+def api_calcular():
+    data = request.get_json(silent=True) or {}
+
+    chave = (data.get("chave") or "").strip()
+    device_id = (data.get("device_id") or "").strip() or "device_unknown"
+
+    # valida licença antes de calcular
+    ok, msg = validar_chave_wrapper(chave, device_id)
+    if not ok:
+        return jsonify(ok=False, msg=str(msg), code="LICENSE")
+
+    produto = (data.get("produto") or "").strip()
+    custo_material = float(data.get("custo_material") or 0)
+    horas = float(data.get("horas") or 0)
+    valor_hora = float(data.get("valor_hora") or 0)
+    despesas_extras = float(data.get("despesas_extras") or 0)
+    margem = float(data.get("margem") or 0)
+    validade_dias = int(data.get("validade_dias") or 7)
+
+    custo_base, preco_final = calcular_preco_local(
+        custo_material=custo_material,
+        horas=horas,
+        valor_hora=valor_hora,
+        despesas_extras=despesas_extras,
+        margem_percent=margem
+    )
+
+    return jsonify(
+        ok=True,
+        produto=produto,
+        custo_base=custo_base,
+        custo_base_fmt=brl(custo_base),
+        preco_final=preco_final,
+        preco_final_fmt=brl(preco_final),
+        validade_dias=validade_dias
+    )
+
+
+@app.get("/pdf")
+def pdf_view():
+    # Página pronta para imprimir e salvar em PDF (Android/Chrome -> Imprimir -> Salvar como PDF)
+    produto = request.args.get("produto", "")
+    custo_base = request.args.get("custo_base", "")
+    preco_final = request.args.get("preco_final", "")
+    validade_dias = request.args.get("validade_dias", "7")
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Orçamento - Arte Preço Pro</title>
+      <style>
+        body{{font-family:Arial, sans-serif; padding:24px;}}
+        .box{{border:1px solid #ddd; border-radius:12px; padding:18px; max-width:520px;}}
+        h1{{margin:0 0 12px;}}
+        .big{{font-size:34px; font-weight:900; margin:10px 0;}}
+        .muted{{color:#555;}}
+        @media print {{
+          .noprint {{ display:none; }}
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="box">
+        <h1>ORÇAMENTO</h1>
+        <div><b>Produto:</b> {produto or "-"}</div>
+        <div><b>Custo Base:</b> {custo_base or "-"}</div>
+        <div class="big">Preço Final: {preco_final or "-"}</div>
+        <div class="muted">Validade: {validade_dias} dia(s)</div>
+        <div class="muted" style="margin-top:16px;">Gerado pelo Arte Preço Pro</div>
+      </div>
+      <div class="noprint" style="margin-top:16px;">
+        <button onclick="window.print()">Imprimir / Salvar em PDF</button>
+      </div>
+      <script>
+        // opcional: abrir direto a tela de impressão
+        // window.print();
+      </script>
+    </body>
+    </html>
+    """
+    return html
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # local
+    app.run(host="0.0.0.0", port=5000, debug=True)
