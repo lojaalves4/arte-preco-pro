@@ -1,304 +1,502 @@
-# -*- coding: utf-8 -*-
-from flask import Flask, request, render_template_string, jsonify
-from datetime import datetime, timedelta
+import os
+import json
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string, make_response, redirect, url_for
 
+# >>> IMPORTS DO SEU PROJETO
+# Se existir core/license_core.py e core/pricing.py, vamos usar.
 from core.license_core import validar_chave
+from core.pricing import calcular_preco  # ajuste se o nome da função for diferente no seu pricing.py
 
 app = Flask(__name__)
 
-APP_VERSION = "v3-calc"
+APP_NAME = "Arte Preço Pro"
 
-# ===== Helpers =====
-def to_float_br(value: str) -> float:
-    s = (value or "").strip()
-    if not s:
-        return 0.0
-    s = s.replace(" ", "")
-    if "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    return float(s)
+# =========================================================
+# Helpers
+# =========================================================
 
-def money_br(v: float) -> str:
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def _get_device_id():
+    """
+    O device_id vem do navegador (localStorage) e é enviado por header/query.
+    """
+    # 1) Header
+    device_id = request.headers.get("X-Device-Id", "").strip()
+    if device_id:
+        return device_id
 
-def calcular(payload: dict) -> dict:
-    produto = (payload.get("produto") or "").strip()
-    material = to_float_br(payload.get("material") or "0")
-    horas = to_float_br(payload.get("horas") or "0")
-    valor_hora = to_float_br(payload.get("valor_hora") or "0")
-    despesas = to_float_br(payload.get("despesas") or "0")
-    margem = to_float_br(payload.get("margem") or "0")
-    validade_dias = int((payload.get("validade_dias") or "7").strip() or "7")
+    # 2) Query / form
+    device_id = request.args.get("device_id", "").strip()
+    if device_id:
+        return device_id
 
-    if not produto:
-        return {"ok": False, "msg": "Informe o nome do produto."}
+    device_id = request.form.get("device_id", "").strip()
+    if device_id:
+        return device_id
 
-    custo_mao_obra = horas * valor_hora
-    custo_total = material + custo_mao_obra + despesas
-    preco_final = custo_total + (custo_total * margem / 100.0)
+    # 3) JSON
+    try:
+        body = request.get_json(silent=True) or {}
+        device_id = str(body.get("device_id", "")).strip()
+        if device_id:
+            return device_id
+    except Exception:
+        pass
 
-    data_emissao = datetime.now()
-    data_validade = data_emissao + timedelta(days=max(0, validade_dias))
+    return ""
 
-    return {
-        "ok": True,
-        "produto": produto,
-        "material": material,
-        "horas": horas,
-        "valor_hora": valor_hora,
-        "despesas": despesas,
-        "margem": margem,
-        "validade_dias": validade_dias,
-        "custo_mao_obra": custo_mao_obra,
-        "custo_total": custo_total,
-        "preco_final": preco_final,
-        "data_emissao": data_emissao.strftime("%d/%m/%Y %H:%M"),
-        "data_validade": data_validade.strftime("%d/%m/%Y"),
-        "preco_final_fmt": money_br(preco_final),
-        "custo_total_fmt": money_br(custo_total),
-        "custo_mao_obra_fmt": money_br(custo_mao_obra),
-        "material_fmt": money_br(material),
-        "valor_hora_fmt": money_br(valor_hora),
-        "despesas_fmt": money_br(despesas),
+
+def _json_ok(**data):
+    return jsonify({"ok": True, **data})
+
+
+def _json_err(msg, **data):
+    return jsonify({"ok": False, "error": msg, **data})
+
+
+# =========================================================
+# PWA files
+# =========================================================
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    manifest_data = {
+        "name": APP_NAME,
+        "short_name": "ArtePreço",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#DCE6D5",
+        "theme_color": "#4E6B3E",
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
     }
+    resp = make_response(json.dumps(manifest_data, ensure_ascii=False))
+    resp.headers["Content-Type"] = "application/manifest+json; charset=utf-8"
+    return resp
 
-# ===== UI =====
-HTML = f"""
+
+@app.get("/service-worker.js")
+def service_worker():
+    """
+    Service Worker simples: cache básico para PWA.
+    """
+    js = r"""
+const CACHE_NAME = "arte-preco-pro-v1";
+const URLS_TO_CACHE = [
+  "/",
+  "/app",
+  "/manifest.webmanifest",
+  "/static/icon-192.png",
+  "/static/icon-512.png"
+];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(URLS_TO_CACHE))
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.map((k) => (k !== CACHE_NAME ? caches.delete(k) : null)))
+    )
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  event.respondWith(
+    caches.match(event.request).then((resp) => resp || fetch(event.request))
+  );
+});
+"""
+    resp = make_response(js)
+    resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
+    return resp
+
+
+# =========================================================
+# Telas
+# =========================================================
+
+HTML_BASE = r"""
 <!doctype html>
 <html lang="pt-br">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Arte Preço Pro</title>
-<style>
-body{{font-family:Arial;background:#DCE6D5;margin:0;padding:16px;}}
-.card{{background:#EEF3EA;padding:18px;border-radius:14px;max-width:820px;margin:auto;}}
-h1{{margin:0 0 6px 0;font-size:34px;}}
-small{{color:#4F5A4A;}}
-label{{font-weight:bold;display:block;margin-top:12px;margin-bottom:6px;}}
-input,textarea{{width:100%;padding:12px;font-size:16px;border-radius:10px;border:1px solid #aaa;box-sizing:border-box;}}
-textarea{{min-height:90px;}}
-.btn{{width:100%;padding:14px;margin-top:14px;font-size:16px;border:none;border-radius:10px;font-weight:bold;}}
-.btn-main{{background:#4E6B3E;color:white;}}
-.btn-gray{{background:#666;color:white;}}
-.btn-red{{background:#B00020;color:white;}}
-.msg{{margin-top:12px;padding:12px;background:#fff;border-radius:10px;}}
-.row{{display:flex;gap:10px;flex-wrap:wrap;}}
-.row .col{{flex:1;min-width:160px;}}
-.big{{font-size:22px;font-weight:bold;}}
-hr{{border:none;border-top:1px solid rgba(0,0,0,.15);margin:16px 0;}}
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{{title}}</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#4E6B3E"/>
+
+  <style>
+    body { font-family: Arial, sans-serif; background:#DCE6D5; margin:0; padding:0; }
+    .wrap { max-width: 820px; margin: 40px auto; padding: 0 16px; }
+    .card { background:#EAF1E5; border:1px solid #c7d4bf; border-radius:14px; padding:18px; }
+    h1 { margin:0 0 10px; }
+    .muted { color:#445; opacity:.85; margin: 6px 0 14px; }
+    label { display:block; font-weight:700; margin-top:12px; }
+    input { width:100%; padding:12px; border-radius:10px; border:1px solid #b8c5b0; font-size:16px; background:#fff; box-sizing:border-box; }
+    button { width:100%; margin-top:14px; padding:14px 12px; border:0; border-radius:12px; background:#4E6B3E; color:#fff; font-size:18px; font-weight:700; cursor:pointer; }
+    .row { display:flex; gap:12px; }
+    .row > div { flex:1; }
+    .msg { margin-top:12px; padding:10px; border-radius:10px; background:#fff; border:1px solid #c7d4bf; }
+    .ok { color:#1e6b1e; font-weight:700; }
+    .err { color:#9a1c1c; font-weight:700; }
+    .btn2 { background:#2d3d25; }
+    .btn3 { background:#7a1f1f; }
+    .big { font-size: 22px; font-weight: 900; margin-top: 10px; }
+    .hide { display:none; }
+  </style>
 </head>
 <body>
-<div class="card">
-  <h1>Arte Preço Pro</h1>
-  <small>{APP_VERSION}</small>
-
-  <!-- Ativação -->
-  <div id="ativacao">
-    <p>Cole sua chave AP-...</p>
-    <input id="keyInput" placeholder="AP-..." />
-    <button class="btn btn-main" onclick="ativar()">Ativar</button>
-    <div id="msg" class="msg"></div>
+  <div class="wrap">
+    <div class="card">
+      {{body|safe}}
+    </div>
   </div>
-
-  <!-- App -->
-  <div id="app" style="display:none;">
-    <div class="msg">✅ <b id="status"></b></div>
-
-    <hr>
-
-    <div class="row">
-      <div class="col">
-        <label>Produto</label>
-        <input id="produto" placeholder="Ex: Logo Barber Prime" />
-      </div>
-      <div class="col">
-        <label>Validade (dias)</label>
-        <input id="validade_dias" value="7" inputmode="numeric" />
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="col">
-        <label>Custo do Material (R$)</label>
-        <input id="material" placeholder="0,00" inputmode="decimal" />
-      </div>
-      <div class="col">
-        <label>Horas Trabalhadas</label>
-        <input id="horas" placeholder="0" inputmode="decimal" />
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="col">
-        <label>Valor da Hora (R$)</label>
-        <input id="valor_hora" placeholder="0,00" inputmode="decimal" />
-      </div>
-      <div class="col">
-        <label>Despesas Extras (R$)</label>
-        <input id="despesas" placeholder="0,00" inputmode="decimal" />
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="col">
-        <label>Margem de Lucro (%)</label>
-        <input id="margem" placeholder="0" inputmode="decimal" />
-      </div>
-    </div>
-
-    <label>Observações</label>
-    <textarea id="obs" placeholder="(opcional)"></textarea>
-
-    <button class="btn btn-main" onclick="calcularPreco()">Calcular</button>
-
-    <div id="resultado" class="msg" style="display:none;"></div>
-
-    <div class="row" style="margin-top:10px;">
-      <button class="btn btn-gray" style="flex:1;" onclick="fechar()">Fechar</button>
-      <button class="btn btn-red" style="flex:1;" onclick="desativar()">Desativar</button>
-    </div>
-
-    <div id="msg2" class="msg" style="display:none;"></div>
-  </div>
-</div>
 
 <script>
-const STORAGE_KEY = "arte_preco_key";
+  // registra SW
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/service-worker.js").catch(()=>{});
+  }
 
-function ativar(){{
-  const key = document.getElementById("keyInput").value.trim();
-  fetch("/validate", {{
-    method:"POST",
-    headers:{{"Content-Type":"application/json"}},
-    body:JSON.stringify({{key:key}})
-  }})
-  .then(r=>r.json())
-  .then(data=>{{
-    if(data.ok){{
-      localStorage.setItem(STORAGE_KEY, key);
-      mostrarApp(data.msg);
-    }} else {{
-      document.getElementById("msg").innerText = data.msg;
-    }}
-  }})
-  .catch(()=> {{
-    document.getElementById("msg").innerText = "Erro de conexão ao validar.";
-  }});
-}}
+  // device_id persistente (fica no celular)
+  function getDeviceId() {
+    let id = localStorage.getItem("ap_device_id");
+    if (!id) {
+      id = "dev_" + Math.random().toString(16).slice(2) + "_" + Date.now();
+      localStorage.setItem("ap_device_id", id);
+    }
+    return id;
+  }
 
-function mostrarApp(msg){{
-  document.getElementById("ativacao").style.display="none";
-  document.getElementById("app").style.display="block";
-  document.getElementById("status").innerText = msg;
-}}
-
-function fechar(){{
-  const el = document.getElementById("msg2");
-  el.style.display = "block";
-  el.innerText = "Pode fechar o app (Home/Recentes). A ativação ficará salva.";
-}}
-
-function desativar(){{
-  localStorage.removeItem(STORAGE_KEY);
-  location.reload();
-}}
-
-function payloadCalc(){{
-  return {{
-    produto: document.getElementById("produto").value,
-    material: document.getElementById("material").value,
-    horas: document.getElementById("horas").value,
-    valor_hora: document.getElementById("valor_hora").value,
-    despesas: document.getElementById("despesas").value,
-    margem: document.getElementById("margem").value,
-    validade_dias: document.getElementById("validade_dias").value,
-    obs: document.getElementById("obs").value
-  }};
-}}
-
-function calcularPreco(){{
-  const key = localStorage.getItem(STORAGE_KEY) || "";
-  fetch("/calc", {{
-    method:"POST",
-    headers:{{"Content-Type":"application/json"}},
-    body:JSON.stringify({{ key:key, ...payloadCalc() }})
-  }})
-  .then(r=>r.json())
-  .then(data=>{{
-    const box = document.getElementById("resultado");
-    box.style.display = "block";
-    if(!data.ok){{
-      box.innerHTML = "<b>Erro:</b> " + (data.msg || "Falha ao calcular.");
-      return;
-    }}
-    box.innerHTML = `
-      <div class="big">Preço Final: ${data.preco_final_fmt}</div>
-      <div style="margin-top:8px;">
-        <b>Custo total:</b> ${data.custo_total_fmt}<br>
-        <b>Mão de obra:</b> ${data.horas} h x ${data.valor_hora_fmt} = ${data.custo_mao_obra_fmt}<br>
-        <b>Material:</b> ${data.material_fmt}<br>
-        <b>Despesas:</b> ${data.despesas_fmt}<br>
-        <b>Emissão:</b> ${data.data_emissao}<br>
-        <b>Válido até:</b> ${data.data_validade} (${data.validade_dias} dias)
-      </div>
-    `;
-  }})
-  .catch(()=> {{
-    const box = document.getElementById("resultado");
-    box.style.display = "block";
-    box.innerHTML = "<b>Erro:</b> Não consegui calcular (sem conexão).";
-  }});
-}}
-
-window.onload = function(){{
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if(saved){{
-    fetch("/validate", {{
-      method:"POST",
-      headers:{{"Content-Type":"application/json"}},
-      body:JSON.stringify({{key:saved}})
-    }})
-    .then(r=>r.json())
-    .then(data=>{{
-      if(data.ok){{
-        mostrarApp(data.msg);
-      }} else {{
-        localStorage.removeItem(STORAGE_KEY);
-      }}
-    }})
-    .catch(()=>{{}});
-  }}
-}}
+  function setKey(key) {
+    localStorage.setItem("ap_key", key);
+  }
+  function getKey() {
+    return localStorage.getItem("ap_key") || "";
+  }
 </script>
+
+{{scripts|safe}}
 </body>
 </html>
 """
 
-# ===== Routes =====
-@app.route("/")
-def index():
-    return render_template_string(HTML)
 
-@app.route("/validate", methods=["POST"])
-def validate():
-    data = request.get_json(force=True) or {}
-    key = (data.get("key") or "").strip()
-    ok, msg = validar_chave(key)
-    return jsonify({"ok": bool(ok), "msg": msg})
+@app.get("/")
+def home():
+    body = r"""
+      <h1>Ativação do Arte Preço Pro</h1>
+      <div class="muted">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
 
-@app.route("/calc", methods=["POST"])
-def calc():
-    data = request.get_json(force=True) or {}
-    key = (data.get("key") or "").strip()
+      <label>Chave</label>
+      <input id="key" placeholder="Cole sua chave AP-..." autocomplete="off"/>
 
-    ok, msg = validar_chave(key)
+      <button onclick="ativar()">Ativar</button>
+
+      <div id="msg" class="msg hide"></div>
+    """
+
+    scripts = r"""
+<script>
+  document.getElementById("key").value = getKey();
+
+  function showMsg(ok, text) {
+    const el = document.getElementById("msg");
+    el.classList.remove("hide");
+    el.innerHTML = ok
+      ? '<span class="ok">✅ ' + text + '</span>'
+      : '<span class="err">❌ ' + text + '</span>';
+  }
+
+  async function ativar() {
+    const key = document.getElementById("key").value.trim();
+    if (!key) return showMsg(false, "Cole uma chave primeiro.");
+
+    const device_id = getDeviceId();
+
+    try {
+      const resp = await fetch("/api/ativar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Device-Id": device_id },
+        body: JSON.stringify({ chave: key, device_id })
+      });
+      const data = await resp.json();
+
+      if (data.ok) {
+        setKey(key);
+        showMsg(true, data.message || "Ativado!");
+        setTimeout(()=>{ window.location.href="/app"; }, 600);
+      } else {
+        showMsg(false, data.error || "Chave inválida.");
+      }
+    } catch (e) {
+      showMsg(false, "Erro ao ativar. Tente novamente.");
+    }
+  }
+</script>
+"""
+    return render_template_string(HTML_BASE, title=APP_NAME, body=body, scripts=scripts)
+
+
+@app.get("/app")
+def app_page():
+    body = r"""
+      <h1>Arte Preço Pro</h1>
+      <div id="status" class="msg">Verificando ativação...</div>
+
+      <div id="conteudo" class="hide">
+        <div class="muted">Preencha os campos e clique em <b>Calcular</b>.</div>
+
+        <label>Produto</label>
+        <input id="produto" placeholder="Ex: Logo Barber Prime"/>
+
+        <div class="row">
+          <div>
+            <label>Custo do Material (R$)</label>
+            <input id="custo_material" inputmode="decimal" placeholder="0"/>
+          </div>
+          <div>
+            <label>Horas Trabalhadas</label>
+            <input id="horas" inputmode="decimal" placeholder="0"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Valor da Hora (R$)</label>
+            <input id="valor_hora" inputmode="decimal" placeholder="0"/>
+          </div>
+          <div>
+            <label>Despesas Extras (R$)</label>
+            <input id="despesas" inputmode="decimal" placeholder="0"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Margem de Lucro (%)</label>
+            <input id="margem" inputmode="decimal" placeholder="0"/>
+          </div>
+          <div>
+            <label>Validade (dias)</label>
+            <input id="validade" inputmode="numeric" value="7"/>
+          </div>
+        </div>
+
+        <button onclick="calcular()">Calcular</button>
+
+        <div id="resultado" class="msg hide"></div>
+
+        <div class="row">
+          <div><button class="btn2" onclick="atualizar()">Atualizar</button></div>
+          <div><button class="btn3" onclick="sair()">Sair</button></div>
+        </div>
+      </div>
+    """
+
+    scripts = r"""
+<script>
+  function showStatus(ok, text) {
+    const el = document.getElementById("status");
+    el.innerHTML = ok
+      ? '<span class="ok">✅ ' + text + '</span>'
+      : '<span class="err">❌ ' + text + '</span>';
+  }
+
+  function showResultado(html) {
+    const el = document.getElementById("resultado");
+    el.classList.remove("hide");
+    el.innerHTML = html;
+  }
+
+  function toNum(v) {
+    if (!v) return 0;
+    v = String(v).replace(/\./g, "").replace(",", "."); // aceita 1.234,56
+    const n = parseFloat(v);
+    return isNaN(n) ? 0 : n;
+  }
+
+  async function checarAtivacao() {
+    const key = getKey();
+    const device_id = getDeviceId();
+    if (!key) {
+      window.location.href = "/";
+      return;
+    }
+
+    try {
+      const resp = await fetch("/api/status", {
+        headers: { "X-Device-Id": device_id }
+      });
+      const data = await resp.json();
+
+      if (data.ok) {
+        showStatus(true, data.message || "Ativado.");
+        document.getElementById("conteudo").classList.remove("hide");
+      } else {
+        showStatus(false, data.error || "Não ativado.");
+        localStorage.removeItem("ap_key");
+        setTimeout(()=>{ window.location.href="/"; }, 600);
+      }
+    } catch(e) {
+      showStatus(false, "Falha ao validar. Recarregue a página.");
+    }
+  }
+
+  async function calcular() {
+    const device_id = getDeviceId();
+    const key = getKey();
+
+    const payload = {
+      chave: key,
+      device_id: device_id,
+      produto: document.getElementById("produto").value.trim(),
+      custo_material: toNum(document.getElementById("custo_material").value),
+      horas: toNum(document.getElementById("horas").value),
+      valor_hora: toNum(document.getElementById("valor_hora").value),
+      despesas: toNum(document.getElementById("despesas").value),
+      margem: toNum(document.getElementById("margem").value),
+      validade: parseInt(document.getElementById("validade").value || "0", 10) || 0
+    };
+
+    try {
+      const resp = await fetch("/api/calcular", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Device-Id": device_id },
+        body: JSON.stringify(payload)
+      });
+      const data = await resp.json();
+
+      if (!data.ok) {
+        showResultado('<span class="err">❌ ' + (data.error || 'Erro ao calcular') + '</span>');
+        return;
+      }
+
+      const html = `
+        <div><b>Produto:</b> ${data.produto}</div>
+        <div class="big">Preço Final: ${data.preco_final_fmt}</div>
+        <div><b>Validade:</b> ${data.validade} dia(s)</div>
+      `;
+      showResultado(html);
+
+    } catch (e) {
+      showResultado('<span class="err">❌ Erro ao calcular. Tente novamente.</span>');
+    }
+  }
+
+  function sair() {
+    // sai do app e volta para ativação
+    localStorage.removeItem("ap_key");
+    window.location.href = "/";
+  }
+
+  function atualizar() {
+    window.location.reload();
+  }
+
+  checarAtivacao();
+</script>
+"""
+    return render_template_string(HTML_BASE, title=APP_NAME, body=body, scripts=scripts)
+
+
+# =========================================================
+# API
+# =========================================================
+
+@app.post("/api/ativar")
+def api_ativar():
+    device_id = _get_device_id()
+    body = request.get_json(silent=True) or {}
+    chave = str(body.get("chave", "")).strip()
+
+    if not chave:
+        return _json_err("Cole a chave.")
+
+    if not device_id:
+        return _json_err("Device ID ausente. Recarregue a página e tente de novo.")
+
+    ok, msg = validar_chave(chave, device_id)
+    if ok:
+        return _json_ok(message=msg or "Ativado.")
+    return _json_err(msg or "Chave inválida.")
+
+
+@app.get("/api/status")
+def api_status():
+    device_id = _get_device_id()
+    # chave fica no navegador, então aqui só checamos se ele consegue chamar.
+    # A tela /app chama esse endpoint e se der erro ele manda pra ativação.
+    # Se quiser validar de verdade aqui, precisa mandar a chave também.
+    return _json_ok(message="Conexão OK. Abra /app para usar.")
+
+
+@app.post("/api/calcular")
+def api_calcular():
+    device_id = _get_device_id()
+    body = request.get_json(silent=True) or {}
+
+    chave = str(body.get("chave", "")).strip()
+    if not chave:
+        return _json_err("Você saiu do app. Ative novamente.")
+
+    if not device_id:
+        return _json_err("Device ID ausente. Recarregue e tente novamente.")
+
+    ok, msg = validar_chave(chave, device_id)
     if not ok:
-        return jsonify({"ok": False, "msg": "Chave inválida ou não ativada. Desative e ative novamente."})
+        return _json_err(msg or "Chave inválida. Ative novamente.")
 
-    r = calcular(data)
-    return jsonify(r)
+    produto = str(body.get("produto", "")).strip() or "Sem nome"
+    custo_material = float(body.get("custo_material", 0) or 0)
+    horas = float(body.get("horas", 0) or 0)
+    valor_hora = float(body.get("valor_hora", 0) or 0)
+    despesas = float(body.get("despesas", 0) or 0)
+    margem = float(body.get("margem", 0) or 0)
+    validade = int(body.get("validade", 0) or 0)
 
+    try:
+        # A sua função de pricing deve retornar um número final.
+        # Se sua função for diferente, me diga o conteúdo do core/pricing.py e eu ajusto.
+        preco_final = calcular_preco(
+            custo_material=custo_material,
+            horas=horas,
+            valor_hora=valor_hora,
+            despesas_extras=despesas,
+            margem_lucro_percent=margem,
+        )
+    except TypeError:
+        # fallback caso o pricing.py seja diferente
+        try:
+            preco_final = calcular_preco(custo_material, horas, valor_hora, despesas, margem)
+        except Exception as e:
+            return _json_err(f"Erro no cálculo: {e}")
+    except Exception as e:
+        return _json_err(f"Erro no cálculo: {e}")
+
+    def brl(v):
+        return "R$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    return _json_ok(
+        produto=produto,
+        preco_final=float(preco_final),
+        preco_final_fmt=brl(float(preco_final)),
+        validade=validade,
+        message=msg
+    )
+
+
+# =========================================================
+# Local run (só pra PC)
+# =========================================================
 if __name__ == "__main__":
-    app.run()
+    # No PC: http://127.0.0.1:5000
+    app.run(host="0.0.0.0", port=5000, debug=True)
