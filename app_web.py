@@ -1,303 +1,170 @@
-from flask import Flask, request, render_template_string, send_from_directory, redirect, url_for, session, jsonify
-from core.pricing import calcular_preco
+# -*- coding: utf-8 -*-
+import os
+import json
+import hashlib
+from flask import Flask, request, redirect, make_response, render_template_string
+
+# ===== Import da licença (chave única) =====
 from core.license_core import validar_chave
 
+APP_NAME = "Arte Preço Pro"
+
 app = Flask(__name__)
-app.secret_key = "ARTEPRECO_SECRET_2026_SUPER"
 
-# =========================
-# PWA
-# =========================
-@app.route("/manifest.json")
-def manifest():
-    return send_from_directory("static", "manifest.json")
+# Cookie onde salvamos a chave no navegador (funciona no celular e PC)
+COOKIE_KEY = "arte_preco_license"
+COOKIE_DAYS = 3650
 
-@app.route("/sw.js")
-def service_worker():
-    return send_from_directory("static", "sw.js")
-
-# =========================
-# API ATIVAÇÃO (COM DEVICE_ID OBRIGATÓRIO)
-# =========================
-@app.route("/api/activate", methods=["POST"])
-def api_activate():
-    data = request.get_json(silent=True) or {}
-    key = (data.get("key") or "").strip()
-    device_id = (data.get("device_id") or "").strip()
-
-    if not device_id:
-        return jsonify({"ok": False, "msg": "Falha ao identificar o aparelho. Limpe os dados do site e tente novamente."}), 400
-
-    ok, info = validar_chave(key, device_id)
-
-    if ok:
-        session["activated"] = True
-        session["key"] = key
-        session["device_id"] = device_id
-        return jsonify({"ok": True, "msg": info})
-
-    return jsonify({"ok": False, "msg": info}), 401
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return ("", 204)
-
-# =========================
-# TELAS
-# =========================
-LOGIN_HTML = """
+HTML_ACTIVATE = """
 <!doctype html>
 <html lang="pt-br">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ativação - Arte Preço Pro</title>
-<link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#4E6B3E">
-<link rel="icon" href="/static/icon-192.png">
-<style>
-body { font-family: Arial; background:#DCE6D5; margin:18px;}
-.card { max-width:520px; margin:auto; background:#EEF3EA; padding:16px; border-radius:12px;}
-input { width:100%; padding:10px; margin-top:10px; font-size:16px;}
-button { width:100%; padding:12px; margin-top:14px; font-size:18px; background:#4E6B3E; color:white; border:none; border-radius:8px;}
-.msg { margin-top:12px; padding:10px; background:white; border-radius:10px; white-space:pre-wrap;}
-.small { font-size: 13px; color:#4F5A4A; }
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Ativação - Arte Preço Pro</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;background:#DCE6D5;margin:0;padding:24px;}
+    .box{max-width:720px;margin:0 auto;background:#EEF3EA;border-radius:14px;padding:20px;border:1px solid #c7d3c0;}
+    h1{margin:0 0 10px 0;font-size:26px;}
+    p{margin:6px 0;color:#2b2b2b}
+    input{width:100%;padding:14px;font-size:16px;border-radius:10px;border:1px solid #aab8a3;}
+    button{width:100%;margin-top:12px;padding:14px;font-size:18px;border-radius:12px;border:none;background:#4E6B3E;color:#fff;font-weight:700;}
+    .msg{margin-top:12px;padding:12px;border-radius:10px;background:#fff;border:1px solid #d1d1d1;}
+    .row{display:flex;gap:10px;margin-top:10px;}
+    .btn2{flex:1;background:#666;}
+    .btn3{flex:1;background:#6E8B57;}
+    small{color:#4F5A4A}
+    code{word-break:break-all}
+  </style>
 </head>
 <body>
-<div class="card">
-<h2>Ativação do Arte Preço Pro</h2>
-<div class="small">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
+  <div class="box">
+    <h1>Ativação do Arte Preço Pro</h1>
+    <p>Cole a chave <b>AP-...</b> (uma vez). O app lembra automaticamente.</p>
 
-<form id="formAtivar">
-<input id="key" placeholder="Cole sua chave AP-..." required>
-<button type="submit">Ativar</button>
-</form>
+    <form method="POST" action="/activate">
+      <input name="license_key" placeholder="Cole sua chave AP-..." value="{{prefill}}" autocomplete="off" />
+      <button type="submit">Ativar</button>
+    </form>
 
-<div id="msg" class="msg" style="display:none;"></div>
-</div>
+    <div class="row">
+      <form method="POST" action="/logout" style="flex:1;">
+        <button class="btn2" type="submit">Sair</button>
+      </form>
 
-<script>
-if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js");
-}
+      <form method="GET" action="/" style="flex:1;">
+        <button class="btn3" type="submit">Atualizar</button>
+      </form>
+    </div>
 
-// UUID v4 fallback (para aparelhos que não têm crypto.randomUUID)
-function uuidv4Fallback() {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
+    {% if msg %}
+      <div class="msg">{{msg}}</div>
+    {% endif %}
 
-function getDeviceId() {
-  let id = localStorage.getItem("artepreco_device_id");
-  if (!id) {
-    try {
-      if (crypto && crypto.randomUUID) id = crypto.randomUUID();
-      else id = uuidv4Fallback();
-    } catch (e) {
-      id = uuidv4Fallback();
-    }
-    localStorage.setItem("artepreco_device_id", id);
-  }
-  return id;
-}
-
-function showMsg(t) {
-  const el = document.getElementById("msg");
-  el.style.display = "block";
-  el.textContent = t;
-}
-
-async function callActivate(key) {
-  const device_id = getDeviceId();
-  const r = await fetch("/api/activate", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ key: key, device_id: device_id })
-  });
-  const data = await r.json().catch(() => ({}));
-  return { ok: r.ok && data.ok, msg: data.msg || "Erro ao ativar." };
-}
-
-// Auto ativar se já tiver chave salva
-(async function autoActivate() {
-  const savedKey = localStorage.getItem("artepreco_key");
-  if (!savedKey) return;
-  try {
-    const res = await callActivate(savedKey);
-    if (res.ok) {
-      window.location.href = "/";
-    } else {
-      localStorage.removeItem("artepreco_key");
-      showMsg(res.msg);
-    }
-  } catch (e) {
-    showMsg("Não consegui conectar ao servidor. Verifique o Wi-Fi e tente novamente.");
-  }
-})();
-
-document.getElementById("formAtivar").addEventListener("submit", async function(e) {
-  e.preventDefault();
-  const key = (document.getElementById("key").value || "").trim();
-  if (!key) return;
-
-  try {
-    const res = await callActivate(key);
-    if (res.ok) {
-      localStorage.setItem("artepreco_key", key);
-      window.location.href = "/";
-    } else {
-      showMsg(res.msg);
-    }
-  } catch (e) {
-    showMsg("Não consegui conectar ao servidor. Verifique o Wi-Fi e tente novamente.");
-  }
-});
-</script>
+    {% if debug %}
+      <div class="msg">
+        <b>Debug:</b><br/>
+        <small>Chave recebida:</small> <code>{{debug_key}}</code><br/>
+        <small>Resultado:</small> <code>{{debug_result}}</code>
+      </div>
+    {% endif %}
+  </div>
 </body>
 </html>
 """
 
-APP_HTML = """
+HTML_APP = """
 <!doctype html>
 <html lang="pt-br">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arte Preço Pro</title>
-<link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#4E6B3E">
-<link rel="icon" href="/static/icon-192.png">
-<style>
-body { font-family: Arial; background:#DCE6D5; margin:18px;}
-.card { max-width:520px; margin:auto; background:#EEF3EA; padding:16px; border-radius:12px;}
-input { width:100%; padding:10px; margin-top:10px; font-size:16px;}
-button { width:100%; padding:12px; margin-top:14px; font-size:18px; background:#4E6B3E; color:white; border:none; border-radius:8px;}
-.res { margin-top:16px; padding:12px; background:white; border-radius:10px; }
-.logout { background:#666; }
-.msg { margin-top:12px; padding:10px; background:white; border-radius:10px; white-space:pre-wrap; display:none;}
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Arte Preço Pro</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;background:#DCE6D5;margin:0;padding:24px;}
+    .box{max-width:860px;margin:0 auto;background:#EEF3EA;border-radius:14px;padding:20px;border:1px solid #c7d3c0;}
+    h1{margin:0 0 12px 0;}
+    .ok{background:#fff;border:1px solid #d1d1d1;padding:12px;border-radius:10px;margin-bottom:14px;}
+    a{color:#2b2b2b}
+    button{padding:12px 16px;border-radius:10px;border:none;background:#666;color:#fff;font-weight:700;}
+  </style>
 </head>
 <body>
-<div class="card">
-<h2>Arte Preço Pro</h2>
+  <div class="box">
+    <h1>Arte Preço Pro</h1>
+    <div class="ok">✅ {{status}}</div>
+    <p>Seu app está liberado. (A próxima tela/funcionalidades podem ficar aqui.)</p>
 
-<button class="logout" type="button" onclick="doLogout()">Sair</button>
-<div id="msg" class="msg"></div>
-
-<form method="post">
-<input name="produto" placeholder="Produto" required>
-<input name="material" type="number" step="0.01" placeholder="Material (R$)" required>
-<input name="horas" type="number" step="0.01" placeholder="Horas" required>
-<input name="valor_hora" type="number" step="0.01" placeholder="Valor Hora (R$)" required>
-<input name="despesas" type="number" step="0.01" placeholder="Despesas (R$)" required>
-<input name="margem" type="number" step="0.01" placeholder="Margem (%)" required>
-<input name="validade_dias" type="number" value="7" required>
-<button type="submit">Calcular</button>
-</form>
-
-{% if resultado %}
-<div class="res">
-<b>Preço Final:</b> R$ {{ "%.2f"|format(resultado["preco_final"]) }}<br>
-<b>Custo Total:</b> R$ {{ "%.2f"|format(resultado["custo_total"]) }}<br>
-<b>Validade:</b> {{ resultado["data_validade"] }}
-</div>
-{% endif %}
-
-</div>
-
-<script>
-function uuidv4Fallback() {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
-
-function getDeviceId() {
-  let id = localStorage.getItem("artepreco_device_id");
-  if (!id) {
-    try {
-      if (crypto && crypto.randomUUID) id = crypto.randomUUID();
-      else id = uuidv4Fallback();
-    } catch (e) {
-      id = uuidv4Fallback();
-    }
-    localStorage.setItem("artepreco_device_id", id);
-  }
-  return id;
-}
-
-function showMsg(t) {
-  const el = document.getElementById("msg");
-  el.style.display = "block";
-  el.textContent = t;
-}
-
-async function autoActivate() {
-  const key = localStorage.getItem("artepreco_key");
-  if (!key) return;
-
-  const device_id = getDeviceId();
-  try {
-    const r = await fetch("/api/activate", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ key: key, device_id: device_id })
-    });
-
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok || !data.ok) {
-      localStorage.removeItem("artepreco_key");
-      window.location.href = "/activate";
-    }
-  } catch (e) {
-    showMsg("Sem conexão com o servidor. Verifique o Wi-Fi.");
-  }
-}
-
-async function doLogout() {
-  try { await fetch("/logout", { method: "POST" }); } catch(e) {}
-  localStorage.removeItem("artepreco_key");
-  window.location.href = "/activate";
-}
-
-autoActivate();
-</script>
+    <form method="POST" action="/logout">
+      <button type="submit">Sair</button>
+    </form>
+  </div>
 </body>
 </html>
 """
 
-def is_activated():
-    return session.get("activated") is True
+def _get_cookie_key(req) -> str:
+    return (req.cookies.get(COOKIE_KEY) or "").strip()
 
-@app.route("/activate")
+def _device_fingerprint(req) -> str:
+    # NÃO é “travar por aparelho”. É só um identificador leve para debug (não impede ativação).
+    ua = (req.headers.get("User-Agent") or "")
+    ip = (req.headers.get("X-Forwarded-For") or req.remote_addr or "")
+    raw = f"{ua}|{ip}".encode("utf-8", "ignore")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+@app.get("/")
+def index():
+    # Se já tem cookie, valida e entra
+    saved = _get_cookie_key(request)
+    if saved:
+        ok, msg = validar_chave(saved)
+        if ok:
+            return render_template_string(HTML_APP, status=msg)
+        # se cookie inválido, cai na ativação e mostra o motivo
+        return render_template_string(HTML_ACTIVATE, msg=f"Chave salva inválida: {msg}", prefill="", debug=False)
+
+    # sem cookie -> tela de ativação
+    return render_template_string(HTML_ACTIVATE, msg="", prefill="", debug=False)
+
+@app.post("/activate")
 def activate():
-    return render_template_string(LOGIN_HTML)
+    try:
+        key = (request.form.get("license_key") or "").strip()
 
-@app.route("/", methods=["GET", "POST"])
-def home():
-    if not is_activated():
-        return redirect(url_for("activate"))
+        if not key:
+            return render_template_string(HTML_ACTIVATE, msg="Cole a chave AP-...", prefill="", debug=False)
 
-    resultado = None
-    if request.method == "POST":
-        resultado = calcular_preco(
-            produto=request.form["produto"],
-            material=float(request.form["material"]),
-            horas=float(request.form["horas"]),
-            valor_hora=float(request.form["valor_hora"]),
-            despesas=float(request.form["despesas"]),
-            margem=float(request.form["margem"]),
-            validade_dias=int(request.form["validade_dias"]),
+        # valida (chave única)
+        ok, msg = validar_chave(key)
+
+        if not ok:
+            # mostra motivo real
+            return render_template_string(HTML_ACTIVATE, msg=msg, prefill=key, debug=True, debug_key=key, debug_result=(ok, msg))
+
+        # salva em cookie por muitos anos
+        resp = make_response(redirect("/"))
+        resp.set_cookie(COOKIE_KEY, key, max_age=COOKIE_DAYS * 24 * 3600, httponly=False, samesite="Lax")
+        return resp
+
+    except Exception as e:
+        # Mostra erro real em tela (para nunca ficar no escuro)
+        return render_template_string(
+            HTML_ACTIVATE,
+            msg=f"Erro ao ativar: {type(e).__name__}: {e}",
+            prefill=(request.form.get('license_key') or ""),
+            debug=True,
+            debug_key=(request.form.get("license_key") or ""),
+            debug_result="EXCEPTION"
         )
 
-    return render_template_string(APP_HTML, resultado=resultado)
+@app.post("/logout")
+def logout():
+    # Apaga o cookie (Sair funciona de verdade)
+    resp = make_response(redirect("/"))
+    resp.set_cookie(COOKIE_KEY, "", expires=0)
+    return resp
 
 if __name__ == "__main__":
+    # local
     app.run(host="0.0.0.0", port=5000, debug=True)
