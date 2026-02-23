@@ -1,11 +1,12 @@
 import os
 from flask import Flask, request, jsonify, render_template_string
 
-# Importa seu validador e, se existir, seu cálculo
+# Importa seu validador
 from core.license_core import validar_chave
 
+# Tenta importar cálculo do core, mas não depende dele
 try:
-    from core.pricing import calcular_preco  # se você tiver essa função no core/pricing.py
+    from core.pricing import calcular_preco  # opcional
 except Exception:
     calcular_preco = None
 
@@ -28,17 +29,12 @@ def _to_float(v):
 
 
 def _fmt_brl(valor: float) -> str:
-    # Formato simples BRL sem depender de locale do sistema
     s = f"{valor:,.2f}"
-    # troca separadores: 1,234.56 -> 1.234,56
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
 
 
 def _calcular_local(payload: dict) -> dict:
-    """
-    Cálculo fallback caso core.pricing não tenha calcular_preco.
-    """
     produto = (payload.get("produto") or "").strip()
     custo_material = _to_float(payload.get("custo_material"))
     horas = _to_float(payload.get("horas"))
@@ -57,7 +53,23 @@ def _calcular_local(payload: dict) -> dict:
         "custo_base_fmt": _fmt_brl(custo_base),
         "preco_final_fmt": _fmt_brl(preco_final),
         "validade_dias": validade_dias,
+        "fonte_calculo": "fallback_interno",
     }
+
+
+def _normalizar_resultado(resultado: dict) -> dict:
+    if not isinstance(resultado, dict):
+        return {"resultado": str(resultado), "fonte_calculo": "core_pricing"}
+
+    # garante campos padrão e formatações
+    if "custo_base" in resultado and "custo_base_fmt" not in resultado:
+        resultado["custo_base_fmt"] = _fmt_brl(_to_float(resultado.get("custo_base")))
+    if "preco_final" in resultado and "preco_final_fmt" not in resultado:
+        resultado["preco_final_fmt"] = _fmt_brl(_to_float(resultado.get("preco_final")))
+    if "validade_dias" not in resultado:
+        resultado["validade_dias"] = 7
+    resultado.setdefault("fonte_calculo", "core_pricing")
+    return resultado
 
 
 # ---------------------------
@@ -70,56 +82,54 @@ def health():
 
 @app.post("/api/ativar")
 def api_ativar():
-    """
-    Valida a chave (1 parâmetro apenas) e devolve ok/msg.
-    """
     data = request.get_json(silent=True) or {}
     chave = (data.get("chave") or "").strip()
 
     if not chave:
         return jsonify({"ok": False, "msg": "Cole a chave AP-..."}), 400
 
-    ok, msg = validar_chave(chave)  # ✅ 1 parâmetro só
+    ok, msg = validar_chave(chave)  # ✅ 1 parâmetro
     return jsonify({"ok": bool(ok), "msg": msg})
 
 
 @app.post("/api/calcular")
 def api_calcular():
-    """
-    Calcula preço, mas só se a chave estiver válida.
-    """
     data = request.get_json(silent=True) or {}
     chave = (data.get("chave") or "").strip()
 
     if not chave:
         return jsonify({"ok": False, "msg": "Chave não informada."}), 400
 
-    ok, msg = validar_chave(chave)  # ✅ 1 parâmetro só
+    ok, msg = validar_chave(chave)
     if not ok:
         return jsonify({"ok": False, "msg": msg}), 403
 
-    # Usa cálculo do core.pricing se existir, senão fallback
+    # Tenta cálculo do core.pricing, mas se der QUALQUER erro, usa fallback
     try:
         if callable(calcular_preco):
-            resultado = calcular_preco(
-                produto=(data.get("produto") or "").strip(),
-                custo_material=_to_float(data.get("custo_material")),
-                horas=_to_float(data.get("horas")),
-                valor_hora=_to_float(data.get("valor_hora")),
-                despesas_extras=_to_float(data.get("despesas_extras")),
-                margem_lucro=_to_float(data.get("margem_lucro")),
-                validade_dias=int(_to_float(data.get("validade_dias") or 7)),
-            )
-            # Se o core.pricing não retornar formatado, a gente garante:
-            if isinstance(resultado, dict):
-                if "preco_final" in resultado and "preco_final_fmt" not in resultado:
-                    resultado["preco_final_fmt"] = _fmt_brl(_to_float(resultado["preco_final"]))
-                if "custo_base" in resultado and "custo_base_fmt" not in resultado:
-                    resultado["custo_base_fmt"] = _fmt_brl(_to_float(resultado["custo_base"]))
-            return jsonify({"ok": True, "msg": "Cálculo concluído.", "data": resultado})
-        else:
-            resultado = _calcular_local(data)
-            return jsonify({"ok": True, "msg": "Cálculo concluído.", "data": resultado})
+            try:
+                resultado = calcular_preco(
+                    produto=(data.get("produto") or "").strip(),
+                    custo_material=_to_float(data.get("custo_material")),
+                    horas=_to_float(data.get("horas")),
+                    valor_hora=_to_float(data.get("valor_hora")),
+                    despesas_extras=_to_float(data.get("despesas_extras")),
+                    margem_lucro=_to_float(data.get("margem_lucro")),
+                    validade_dias=int(_to_float(data.get("validade_dias") or 7)),
+                )
+                resultado = _normalizar_resultado(resultado)
+                return jsonify({"ok": True, "msg": "Cálculo concluído.", "data": resultado})
+            except Exception as e_core:
+                # cai para fallback, mas avisa o motivo
+                fb = _calcular_local(data)
+                fb["aviso"] = f"Core pricing falhou e usei fallback. Motivo: {e_core}"
+                return jsonify({"ok": True, "msg": "Cálculo concluído (fallback).", "data": fb})
+
+        # sem core.pricing -> fallback
+        fb = _calcular_local(data)
+        fb["aviso"] = "core.pricing não encontrado; usei cálculo interno."
+        return jsonify({"ok": True, "msg": "Cálculo concluído (fallback).", "data": fb})
+
     except Exception as e:
         return jsonify({"ok": False, "msg": f"Erro ao calcular: {e}"}), 500
 
@@ -155,6 +165,7 @@ HTML = r"""
     .row > div { flex: 1; }
     .big { font-size: 22px; font-weight: 900; margin-top: 12px; }
     .muted { color:#333; opacity: .85; }
+    .small { font-size: 13px; opacity: .85; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -162,7 +173,6 @@ HTML = r"""
     <div class="card">
       <h1>Arte Preço Pro</h1>
 
-      <!-- ATIVAÇÃO -->
       <div id="box_ativacao">
         <div class="muted">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
 
@@ -174,7 +184,6 @@ HTML = r"""
         <div id="msg_ativar" class="msg" style="display:none;"></div>
       </div>
 
-      <!-- APP -->
       <div id="box_app" style="display:none;">
         <div id="status_ok" class="msg ok" style="display:none;"></div>
 
@@ -220,7 +229,6 @@ HTML = r"""
   </div>
 
 <script>
-  // registra service worker se existir (opcional)
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
   }
@@ -232,17 +240,9 @@ HTML = r"""
     el.textContent = text;
   }
 
-  function getKey(){
-    return localStorage.getItem("AP_KEY") || "";
-  }
-
-  function setKey(k){
-    localStorage.setItem("AP_KEY", k);
-  }
-
-  function clearKey(){
-    localStorage.removeItem("AP_KEY");
-  }
+  function getKey(){ return localStorage.getItem("AP_KEY") || ""; }
+  function setKey(k){ localStorage.setItem("AP_KEY", k); }
+  function clearKey(){ localStorage.removeItem("AP_KEY"); }
 
   function showApp(msg){
     document.getElementById("box_ativacao").style.display = "none";
@@ -281,15 +281,12 @@ HTML = r"""
   async function revalidar(){
     const chave = getKey();
     const msg = document.getElementById("msg_app");
-    if(!chave){
-      showActivation();
-      return;
-    }
+    if(!chave){ showActivation(); return; }
+
     const res = await postJSON("/api/ativar", { chave });
     if(res.data.ok){
       showMsg(msg, res.data.msg || "✅ Chave ok.", true);
     } else {
-      // Se falhar, apaga e volta pra ativação
       clearKey();
       showActivation();
       showMsg(document.getElementById("msg_ativar"), res.data.msg || "Chave inválida.", false);
@@ -301,10 +298,7 @@ HTML = r"""
     const out = document.getElementById("resultado");
     const msg = document.getElementById("msg_app");
 
-    if(!chave){
-      showActivation();
-      return;
-    }
+    if(!chave){ showActivation(); return; }
 
     const payload = {
       chave: chave,
@@ -318,30 +312,38 @@ HTML = r"""
     };
 
     const res = await postJSON("/api/calcular", payload);
+
     if(res.data.ok){
       const d = res.data.data || {};
       out.style.display = "block";
       out.classList.remove("err"); out.classList.add("ok");
+
+      const aviso = d.aviso ? `<div class="small">⚠️ ${d.aviso}</div>` : "";
+      const fonte = d.fonte_calculo ? `<div class="small">Fonte: ${d.fonte_calculo}</div>` : "";
+
       out.innerHTML = `
         <div><b>Produto:</b> ${d.produto || "-"}</div>
         <div><b>Custo Base:</b> ${d.custo_base_fmt || d.custo_base || "-"}</div>
         <div class="big">Preço Final: ${d.preco_final_fmt || d.preco_final || "-"}</div>
         <div class="muted">Validade: ${d.validade_dias || 7} dia(s)</div>
+        ${fonte}
+        ${aviso}
       `;
       msg.style.display = "none";
-    } else {
-      // se der 403 (chave inválida), volta pra ativação
-      if(res.status === 403){
-        clearKey();
-        showActivation();
-        showMsg(document.getElementById("msg_ativar"), res.data.msg || "Chave inválida.", false);
-        return;
-      }
-      showMsg(msg, res.data.msg || "Erro ao calcular.", false);
+      return;
     }
+
+    // erro
+    if(res.status === 403){
+      clearKey();
+      showActivation();
+      showMsg(document.getElementById("msg_ativar"), res.data.msg || "Chave inválida.", false);
+      return;
+    }
+
+    showMsg(msg, res.data.msg || "Erro ao calcular.", false);
   }
 
-  // Eventos
   document.getElementById("btn_ativar").addEventListener("click", ()=>{
     const chave = document.getElementById("inp_chave").value.trim();
     ativar(chave);
@@ -350,7 +352,6 @@ HTML = r"""
   document.getElementById("btn_calcular").addEventListener("click", calcular);
 
   document.getElementById("btn_sair").addEventListener("click", ()=>{
-    // "Sair" aqui só volta para a tela de ativação (sem apagar a chave)
     showActivation();
     document.getElementById("inp_chave").value = getKey();
     showMsg(document.getElementById("msg_ativar"), "Chave salva. Se quiser, clique Ativar novamente.", true);
@@ -358,15 +359,16 @@ HTML = r"""
 
   document.getElementById("btn_revalidar").addEventListener("click", revalidar);
 
-  // Ao abrir: se já tiver chave salva, tenta validar e entra no app
   window.addEventListener("load", async ()=>{
     const chave = getKey();
     if(chave){
       document.getElementById("inp_chave").value = chave;
-      await revalidar();
-      // se revalidar manteve a chave, mostra app
-      if(getKey()){
+      const res = await postJSON("/api/ativar", { chave });
+      if(res.data.ok){
         showApp("✅ Chave reconhecida. App liberado.");
+      } else {
+        clearKey();
+        showActivation();
       }
     }
   });
@@ -381,7 +383,6 @@ def index():
     return render_template_string(HTML)
 
 
-# Para rodar localmente: python app_web.py
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
