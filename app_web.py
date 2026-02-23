@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory, Response
+import os
 
 app = Flask(__name__)
 
@@ -52,6 +53,14 @@ HTML = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Arte Preço Pro</title>
+
+  <!-- PWA -->
+  <meta name="theme-color" content="#4d6b3a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+
   <style>
     :root{
       --bg:#dfe8d6;
@@ -235,6 +244,13 @@ HTML = """
   </div>
 
 <script>
+  // PWA: registrar service worker
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(()=>{});
+    });
+  }
+
   function getDeviceId(){
     let id = localStorage.getItem("ap_device_id");
     if(!id){
@@ -280,6 +296,8 @@ HTML = """
       msgAtiv.textContent = msg;
       msgAtiv.className = "msg bad";
       show(msgAtiv);
+    } else {
+      hide(msgAtiv);
     }
   }
 
@@ -351,6 +369,7 @@ HTML = """
   });
 
   document.getElementById("btn_sair").addEventListener("click", ()=>{
+    // Só volta pra tela de ativação. NÃO APAGA A CHAVE.
     voltarParaAtivacao("");
   });
 
@@ -451,6 +470,33 @@ HTML = """
 @app.get("/")
 def home():
     return render_template_string(HTML)
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    # PWA manifest
+    m = """
+{
+  "name": "Arte Preço Pro",
+  "short_name": "ArtePreço",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#dfe8d6",
+  "theme_color": "#4d6b3a",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
+""".strip()
+    return Response(m, mimetype="application/manifest+json")
+
+
+@app.get("/sw.js")
+def service_worker():
+    # Service worker tem que ficar na raiz pra controlar o site todo
+    return send_from_directory("static", "sw.js", mimetype="application/javascript")
 
 
 @app.post("/api/ativar")
