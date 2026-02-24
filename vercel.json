@@ -1,23 +1,14 @@
 {
-  "name": "Arte Preço Pro",
-  "short_name": "ArtePreço",
-  "id": "arte-preco-pro",
-  "start_url": "/",
-  "scope": "/",
-  "display": "standalone",
-  "orientation": "portrait",
-  "background_color": "#DCE5D5",
-  "theme_color": "#4E633E",
-  "lang": "pt-BR",
-  "icons": [
+  "builds": [
     {
-      "src": "/static/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png"
-    },
+      "src": "app_web.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
     {
-      "src": "/static/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png"
+      "src": "/(.*)",
+      "dest": "app_web.py"
     }
   ]
+}
