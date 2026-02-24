@@ -1,1 +1,2 @@
-Flask
+Flask==3.0.2
+reportlab==4.2.0
