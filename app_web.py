@@ -1,4 +1,3 @@
-import os
 import io
 import json
 from datetime import datetime
@@ -62,7 +61,6 @@ def validar_licenca(key: str):
     # tenta usar o seu core.license_core
     try:
         from core.license_core import validar_chave  # seu projeto já tem isso
-        # Alguns projetos mudam assinatura. A sua agora está aceitando 1 argumento.
         ok, msg = validar_chave(key)
         return (bool(ok), str(msg))
     except Exception:
@@ -93,7 +91,10 @@ HTML_INDEX = r"""<!doctype html>
       --bg: #DCE5D5;
       --card: #E9F0E5;
       --btn: #4E633E;
-      --btn2: #3f5233;
+      --btn2: #6b6b6b;
+      --btn3: #3f5233;
+      --warn: #9c4a00;
+      --danger: #8a1f1f;
       --txt: #1a1a1a;
       --muted: #58635a;
       --line: rgba(0,0,0,.12);
@@ -108,16 +109,21 @@ HTML_INDEX = r"""<!doctype html>
     input { width: 100%; box-sizing: border-box; padding: 14px; border-radius: 10px; border: 1px solid var(--line); font-size: 16px; background: var(--white); }
     .row { display:flex; gap: 10px; }
     .row > div { flex: 1; }
-    .btn { width:100%; background: var(--btn); color: white; font-weight: 700; border:0; padding: 16px; border-radius: 12px; font-size: 18px; cursor:pointer; }
+    .btn { width:100%; color: white; font-weight: 700; border:0; padding: 16px; border-radius: 12px; font-size: 18px; cursor:pointer; }
     .btn:active { transform: scale(.99); }
-    .btn2 { background: #6b6b6b; }
-    .btn3 { background: var(--btn2); }
+    .btn-primary { background: var(--btn); }
+    .btn-gray { background: var(--btn2); }
+    .btn-dark { background: var(--btn3); }
+    .btn-warn { background: var(--warn); }
+    .btn-danger { background: var(--danger); }
+
     .msg { margin-top: 10px; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(255,255,255,.6); }
     .ok { border-color: rgba(0,128,0,.25); }
     .err { border-color: rgba(220,0,0,.25); }
     .small { color: var(--muted); font-size: 13px; margin-top: 6px; }
     .big { font-size: 36px; font-weight: 800; margin-top: 8px; }
     .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; padding: 2px 6px; background: rgba(0,0,0,.08); border-radius: 6px; }
+    hr { border:0; border-top:1px solid var(--line); margin: 16px 0; }
   </style>
 </head>
 
@@ -130,7 +136,7 @@ HTML_INDEX = r"""<!doctype html>
       <label>Chave</label>
       <input id="inpKey" placeholder="Cole sua chave AP-..." />
       <div style="height:12px"></div>
-      <button class="btn" onclick="ativar()">Ativar</button>
+      <button class="btn btn-primary" onclick="ativar()">Ativar</button>
       <div id="authMsg" class="msg" style="display:none;"></div>
     </div>
 
@@ -148,7 +154,7 @@ HTML_INDEX = r"""<!doctype html>
         </div>
         <div>
           <label>E-mail</label>
-          <input id="emp_email" placeholder="Ex: loj...@gmail.com" />
+          <input id="emp_email" placeholder="Ex: contato@..." />
         </div>
       </div>
       <label>Endereço</label>
@@ -169,6 +175,8 @@ HTML_INDEX = r"""<!doctype html>
       </div>
       <label>Endereço</label>
       <input id="cli_end" placeholder="Ex: Rua ..., nº ..." />
+
+      <hr/>
 
       <h2>Orçamento</h2>
       <label>Produto/Serviço</label>
@@ -198,21 +206,28 @@ HTML_INDEX = r"""<!doctype html>
       <input id="validade" placeholder="Ex: 7" inputmode="numeric" />
 
       <div style="height:14px"></div>
-      <button class="btn" onclick="calcular()">Calcular</button>
+      <button class="btn btn-primary" onclick="calcular()">Calcular</button>
 
       <div id="resBox" class="msg" style="display:none; margin-top:14px;"></div>
 
       <div style="height:10px"></div>
-      <button class="btn btn3" onclick="gerarPDF()">Gerar PDF</button>
+      <button class="btn btn-dark" onclick="gerarPDF()">Gerar PDF</button>
 
       <div style="height:10px"></div>
       <div class="row">
-        <div><button class="btn btn2" onclick="sair()">Sair</button></div>
-        <div><button class="btn btn3" onclick="revalidar()">Revalidar chave</button></div>
+        <div><button class="btn btn-gray" onclick="revalidar()">Revalidar chave</button></div>
+        <div><button class="btn btn-gray" onclick="sair()">Sair (remover chave)</button></div>
+      </div>
+
+      <div style="height:10px"></div>
+      <div class="row">
+        <div><button class="btn btn-warn" onclick="limparDadosEmpresaCliente()">Limpar dados (Empresa/Cliente)</button></div>
+        <div><button class="btn btn-danger" onclick="resetTotal()">Reset total (apagar tudo)</button></div>
       </div>
 
       <div class="small" style="margin-top:10px;">
-        Se aparecer 500 ou travar, geralmente é cache antigo. Faça: Chrome → Configurações → Privacidade → Limpar dados → e abra de novo.
+        • “Limpar dados (Empresa/Cliente)” apaga somente os dados salvos (não remove a chave).<br/>
+        • “Reset total” apaga tudo e volta para a ativação.
       </div>
     </div>
   </div>
@@ -282,6 +297,23 @@ HTML_INDEX = r"""<!doctype html>
     } catch(e) {}
   }
 
+  function limparCamposEmpresaCliente() {
+    document.getElementById("emp_nome").value = "";
+    document.getElementById("emp_tel").value = "";
+    document.getElementById("emp_email").value = "";
+    document.getElementById("emp_end").value = "";
+    document.getElementById("cli_nome").value = "";
+    document.getElementById("cli_tel").value = "";
+    document.getElementById("cli_email").value = "";
+    document.getElementById("cli_end").value = "";
+  }
+
+  function limparResultado() {
+    const rb = document.getElementById("resBox");
+    rb.style.display = "none";
+    rb.innerHTML = "";
+  }
+
   async function ativar() {
     const key = (document.getElementById("inpKey").value || "").trim();
     if (!key) { setMsg("authMsg", "Cole a chave.", "err"); return; }
@@ -321,10 +353,30 @@ HTML_INDEX = r"""<!doctype html>
   }
 
   function sair() {
-    // mantém empresa/cliente salvos, mas remove a chave
+    // remove somente a chave, mantendo os dados caso o usuário queira
     localStorage.removeItem(LS_KEY);
     document.getElementById("inpKey").value = "";
-    document.getElementById("resBox").style.display = "none";
+    limparResultado();
+    showAuth();
+  }
+
+  function limparDadosEmpresaCliente() {
+    if (!confirm("Tem certeza?\n\nVai apagar os dados salvos de Empresa e Cliente.\nA chave vai continuar ativada.")) return;
+    localStorage.removeItem(LS_EMP);
+    localStorage.removeItem(LS_CLI);
+    limparCamposEmpresaCliente();
+    limparResultado();
+    alert("✅ Dados de Empresa/Cliente apagados.");
+  }
+
+  function resetTotal() {
+    if (!confirm("ATENÇÃO!\n\nIsso vai apagar TUDO:\n- chave\n- dados da empresa\n- dados do cliente\n\nDeseja continuar?")) return;
+    localStorage.removeItem(LS_KEY);
+    localStorage.removeItem(LS_EMP);
+    localStorage.removeItem(LS_CLI);
+    document.getElementById("inpKey").value = "";
+    limparCamposEmpresaCliente();
+    limparResultado();
     showAuth();
   }
 
@@ -337,15 +389,7 @@ HTML_INDEX = r"""<!doctype html>
     const margem = document.getElementById("margem").value || "";
     const validade = document.getElementById("validade").value || "";
 
-    return {
-      produto,
-      custo_material,
-      horas,
-      valor_hora,
-      despesas,
-      margem,
-      validade
-    };
+    return { produto, custo_material, horas, valor_hora, despesas, margem, validade };
   }
 
   async function calcular() {
@@ -355,12 +399,7 @@ HTML_INDEX = r"""<!doctype html>
     const dados = collectCalc();
     const {empresa, cliente} = saveEmpresaCliente();
 
-    const payload = {
-      key,
-      empresa,
-      cliente,
-      ...dados
-    };
+    const payload = { key, empresa, cliente, ...dados };
 
     const r = await fetch("/api/calc", {
       method: "POST",
@@ -370,7 +409,10 @@ HTML_INDEX = r"""<!doctype html>
 
     const txt = await r.text();
     if (!r.ok) {
-      setMsg("resBox", txt, "err");
+      const el = document.getElementById("resBox");
+      el.style.display = "block";
+      el.className = "msg err";
+      el.innerText = txt;
       return;
     }
 
@@ -395,12 +437,7 @@ HTML_INDEX = r"""<!doctype html>
     const dados = collectCalc();
     const {empresa, cliente} = saveEmpresaCliente();
 
-    const payload = {
-      key,
-      empresa,
-      cliente,
-      ...dados
-    };
+    const payload = { key, empresa, cliente, ...dados };
 
     const r = await fetch("/api/pdf", {
       method: "POST",
@@ -421,6 +458,7 @@ HTML_INDEX = r"""<!doctype html>
 
   // boot
   (async function(){
+    // tenta registrar SW (se existir)
     if ("serviceWorker" in navigator) {
       try { await navigator.serviceWorker.register("/static/sw.js"); } catch(e) {}
     }
@@ -610,5 +648,4 @@ def api_pdf():
 # ============================================================
 # Vercel entrypoint
 # ============================================================
-# Para Vercel Python Runtime: exporta "app"
-# (o Vercel detecta o Flask app automaticamente)
+# O Vercel detecta o Flask app pela variável "app"
