@@ -1,776 +1,949 @@
 import os
 import json
-import base64
 import time
+import base64
+import hmac
+import hashlib
+import sqlite3
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-from flask import Flask, request, redirect, make_response
+from flask import Flask, request, make_response, redirect, render_template_string, send_from_directory
 
-# ==========================================
-#  CONFIG
-# ==========================================
-APP_NAME = "Arte Preço Pro"
+# ============================================================
+# APP CONFIG
+# ============================================================
 
-# Cookies
-COOKIE_KEY = "ap_lic_key"
-COOKIE_COMPANY = "ap_company_data"
+app = Flask(__name__, static_folder=None)
 
-# (Opcional) para identificar o navegador/instalação
-DEVICE_KEY = "ap_device_id"
+# Diretório de arquivos estáticos (manifest, sw, ícones)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
 
-# Segredo do servidor (Vercel ENV)
 APP_SECRET = os.environ.get("APP_SECRET", "ARTEPRECO_SUPER_SEGREDO_2026")
 
-# ==========================================
-#  APP
-#  IMPORTANTE: static_folder/static_url_path
-#  para servir /static/* corretamente e o PWABuilder encontrar manifest/sw/icons
-# ==========================================
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+# ============================================================
+# ✅ 0) Rotas de PWA (manifest, service worker, ícones)
+#    (Vercel + Flask às vezes não serve /static sozinho)
+# ============================================================
 
-
-# ==========================================
-#  HELPERS
-# ==========================================
-def _now_fmt():
-    try:
-        return datetime.now().strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        return ""
-
-
-def _get_cookie(req, name):
-    try:
-        return req.cookies.get(name, "")
-    except Exception:
-        return ""
-
-
-def _set_cookie(resp, name, value, max_age_days=365):
-    try:
-        resp.set_cookie(
-            name,
-            value,
-            max_age=max_age_days * 24 * 60 * 60,
-            samesite="Lax",
-            secure=True,
-            httponly=False,
-        )
-    except Exception:
-        pass
+@app.get("/manifest.webmanifest")
+def manifest_webmanifest():
+    # Preferimos entregar o manifest que está em /static/manifest.json
+    path = os.path.join(STATIC_DIR, "manifest.json")
+    if os.path.exists(path):
+        resp = make_response(send_from_directory(STATIC_DIR, "manifest.json"))
+        resp.headers["Content-Type"] = "application/manifest+json; charset=utf-8"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    # fallback mínimo (caso alguém apague o arquivo)
+    data = {
+        "name": "Arte Preço Pro",
+        "short_name": "ArtePreço",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#DCE6D5",
+        "theme_color": "#4E683E",
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    }
+    resp = make_response(json.dumps(data, ensure_ascii=False))
+    resp.headers["Content-Type"] = "application/manifest+json; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
-
-def _clear_cookie(resp, name):
-    try:
-        resp.set_cookie(name, "", expires=0)
-    except Exception:
-        pass
+@app.get("/sw.js")
+def service_worker():
+    # Entrega o SW que está em /static/sw.js
+    path = os.path.join(STATIC_DIR, "sw.js")
+    if os.path.exists(path):
+        resp = make_response(send_from_directory(STATIC_DIR, "sw.js"))
+        resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    # fallback (offline bem simples)
+    js = """const CACHE_NAME='artepreco-v1';
+self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE_NAME)); });
+self.addEventListener('fetch', e => { e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))); });
+"""
+    resp = make_response(js)
+    resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
+@app.get("/static/<path:filename>")
+def static_files(filename):
+    # Serve qualquer arquivo dentro da pasta /static
+    return send_from_directory(STATIC_DIR, filename)
 
-def _safe_float(v, default=0.0):
-    try:
-        if v is None:
-            return default
-        if isinstance(v, (int, float)):
-            return float(v)
-        s = str(v).strip().replace(".", "").replace(",", ".")
-        if s == "":
-            return default
-        return float(s)
-    except Exception:
-        return default
+@app.get("/favicon.ico")
+def favicon():
+    # Evita erro 404 no console
+    fav = os.path.join(STATIC_DIR, "icon-192.png")
+    if os.path.exists(fav):
+        return send_from_directory(STATIC_DIR, "icon-192.png")
+    return ("", 204)
 
-
-def _safe_int(v, default=0):
-    try:
-        if v is None:
-            return default
-        if isinstance(v, int):
-            return v
-        s = str(v).strip()
-        if s == "":
-            return default
-        return int(float(s.replace(",", ".")))
-    except Exception:
-        return default
-
-
-def _fmt_money(v):
-    try:
-        vv = float(v)
-    except Exception:
-        vv = 0.0
-    # pt-BR simples
-    s = f"{vv:,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-    return s
-
+# ============================================================
+# LICENÇA (CHAVE AP-...)
+# ============================================================
 
 def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
 def _b64url_decode(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
+    pad = "=" * ((4 - len(s) % 4) % 4)
     return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
 
+def gerar_chave(payload: dict) -> str:
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    body_b64 = _b64url(body)
+    sig = hmac.new(APP_SECRET.encode("utf-8"), body_b64.encode("utf-8"), hashlib.sha256).digest()
+    sig_b64 = _b64url(sig)
+    return f"AP-{body_b64}.{sig_b64}"
 
-def _sign(payload_b64: str) -> str:
-    # assinatura simples (não-cripto forte) para manter compatível com seu projeto
-    # se você já tinha outro método de assinatura, me manda que eu ajusto.
-    import hmac
-    import hashlib
+def validar_chave(chave: str) -> Tuple[bool, str, Optional[dict]]:
+    if not chave or not chave.startswith("AP-"):
+        return False, "Formato inválido.", None
 
-    return _b64url(hmac.new(APP_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest())
-
-
-def gerar_chave(exp_ts: int) -> str:
-    payload = {"c": "ARTE_PECO_PRO", "exp": int(exp_ts)}
-    payload_b = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    payload_b64 = _b64url(payload_b)
-    sig = _sign(payload_b64)
-    return f"AP-{payload_b64}.{sig}"
-
-
-def validar_chave(token: str) -> (bool, str):
     try:
-        if not token or not token.startswith("AP-"):
-            return False, "Formato inválido"
-        body = token[3:]
-        if "." not in body:
-            return False, "Formato inválido"
-        payload_b64, sig = body.split(".", 1)
-        if _sign(payload_b64) != sig:
-            return False, "Assinatura inválida"
+        token = chave[3:]
+        body_b64, sig_b64 = token.split(".", 1)
+        expected_sig = hmac.new(APP_SECRET.encode("utf-8"), body_b64.encode("utf-8"), hashlib.sha256).digest()
+        if _b64url(expected_sig) != sig_b64:
+            return False, "Assinatura inválida.", None
 
-        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+        payload = json.loads(_b64url_decode(body_b64).decode("utf-8"))
         exp = int(payload.get("exp", 0))
-        if exp <= 0:
-            return False, "Sem expiração"
-        if int(time.time()) > exp:
-            return False, "Chave expirada"
-        return True, "OK"
-    except Exception:
-        return False, "Erro ao validar"
+        if exp and time.time() > exp:
+            return False, "Chave expirada.", payload
 
+        return True, "OK", payload
+    except Exception as e:
+        return False, f"Erro ao validar chave: {e}", None
 
-def _get_device_id(req):
-    did = _get_cookie(req, DEVICE_KEY)
-    if did:
-        return did
-    # cria um id simples
-    did = _b64url(os.urandom(12))
-    return did
+# ============================================================
+# PERSISTÊNCIA (DB simples) + CONFIG DA EMPRESA
+# ============================================================
 
+DB_PATH = os.path.join(os.path.dirname(__file__), "artepreco.db")
 
-def calcular_preco(custo_material, horas, valor_hora, despesas_extras, margem_pct):
-    """
-    cálculo padrão:
-      custo_base = custo_material + (horas * valor_hora) + despesas_extras
-      preco_final = custo_base * (1 + margem_pct/100)
-    """
-    custo_base = float(custo_material) + (float(horas) * float(valor_hora)) + float(despesas_extras)
-    preco_final = custo_base * (1.0 + float(margem_pct) / 100.0)
-    return custo_base, preco_final
+def db_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+def db_init():
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kv (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# ==========================================
-#  HTML
-# ==========================================
-HTML = """
+db_init()
+
+def kv_get(k: str, default: str = "") -> str:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT v FROM kv WHERE k=?", (k,))
+    row = cur.fetchone()
+    conn.close()
+    return (row["v"] if row else default)
+
+def kv_set(k: str, v: str) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+    conn.commit()
+    conn.close()
+
+# chaves
+KV_ACTIVATED = "activated_key"
+KV_COMPANY_JSON = "company_json"
+
+# ============================================================
+# REGRAS DE CÁLCULO
+# ============================================================
+
+@dataclass
+class CalcInput:
+    produto: str
+    custo_material: float
+    horas_trabalhadas: float
+    valor_hora: float
+    despesas_extras: float
+    margem_lucro_pct: float
+    validade_dias: int
+
+@dataclass
+class CalcResult:
+    custo_base: float
+    preco_final: float
+    preco_final_fmt: str
+    custo_base_fmt: str
+
+def _fmt_brl(v: float) -> str:
+    s = f"{v:,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
+
+def calcular_preco(ci: CalcInput) -> CalcResult:
+    custo_trabalho = max(ci.horas_trabalhadas, 0) * max(ci.valor_hora, 0)
+    custo_base = max(ci.custo_material, 0) + max(ci.despesas_extras, 0) + custo_trabalho
+    mult = 1.0 + (max(ci.margem_lucro_pct, 0) / 100.0)
+    preco_final = custo_base * mult
+    return CalcResult(
+        custo_base=custo_base,
+        preco_final=preco_final,
+        preco_final_fmt=_fmt_brl(preco_final),
+        custo_base_fmt=_fmt_brl(custo_base),
+    )
+
+# ============================================================
+# PDF (GERAÇÃO SIMPLES)
+# ============================================================
+
+def gerar_pdf_bytes(dados_empresa: dict, dados_cliente: dict, ci: CalcInput, cr: CalcResult) -> bytes:
+    # PDF simples via texto (sem lib externa) — funciona bem na Vercel
+    # Estrutura minimalista PDF (ok para uso)
+    # Observação: NÃO mostramos margem no PDF (como você pediu).
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    empresa_nome = dados_empresa.get("nome", "").strip()
+    empresa_tel = dados_empresa.get("telefone", "").strip()
+    empresa_email = dados_empresa.get("email", "").strip()
+    empresa_end = dados_empresa.get("endereco", "").strip()
+
+    cliente_nome = dados_cliente.get("nome", "").strip()
+    cliente_tel = dados_cliente.get("telefone", "").strip()
+    cliente_email = dados_cliente.get("email", "").strip()
+    cliente_end = dados_cliente.get("endereco", "").strip()
+
+    lines = []
+    lines.append("ORCAMENTO - ARTE PRECO PRO")
+    lines.append("")
+    lines.append(f"Data: {now}")
+    lines.append("")
+    lines.append("DADOS DA EMPRESA")
+    lines.append(f"Nome: {empresa_nome}")
+    lines.append(f"Telefone: {empresa_tel}")
+    lines.append(f"E-mail: {empresa_email}")
+    lines.append(f"Endereço: {empresa_end}")
+    lines.append("")
+    lines.append("DADOS DO CLIENTE")
+    lines.append(f"Nome: {cliente_nome}")
+    lines.append(f"Telefone: {cliente_tel}")
+    lines.append(f"E-mail: {cliente_email}")
+    lines.append(f"Endereço: {cliente_end}")
+    lines.append("")
+    lines.append("DETALHES DO SERVIÇO")
+    lines.append(f"Produto/Serviço: {ci.produto}")
+    lines.append(f"Custo material: {_fmt_brl(ci.custo_material)}")
+    lines.append(f"Trabalho: {ci.horas_trabalhadas:g}h x {_fmt_brl(ci.valor_hora)}")
+    lines.append(f"Despesas extras: {_fmt_brl(ci.despesas_extras)}")
+    lines.append("")
+    lines.append(f"Custo Base: {cr.custo_base_fmt}")
+    lines.append(f"Preco Final: {cr.preco_final_fmt}")
+    lines.append(f"Validade: {ci.validade_dias} dia(s)")
+    text = "\n".join(lines)
+
+    # PDF básico (texto)
+    # monta um PDF simples com fonte padrão
+    def pdf_escape(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    content_stream = "BT\n/F1 14 Tf\n50 760 Td\n"
+    y = 0
+    for line in text.split("\n"):
+        if y != 0:
+            content_stream += "0 -18 Td\n"
+        content_stream += f"({pdf_escape(line)}) Tj\n"
+        y += 1
+    content_stream += "ET\n"
+    content_bytes = content_stream.encode("latin-1", errors="ignore")
+
+    objects = []
+    offsets = []
+
+    def add_obj(s: bytes):
+        offsets.append(sum(len(o) for o in objects))
+        objects.append(s)
+
+    # PDF header
+    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    objects.append(header)
+
+    # 1) catalog
+    add_obj(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    # 2) pages
+    add_obj(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    # 3) page
+    add_obj(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n")
+    # 4) font
+    add_obj(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+    # 5) contents
+    add_obj(f"5 0 obj\n<< /Length {len(content_bytes)} >>\nstream\n".encode("utf-8") + content_bytes + b"\nendstream\nendobj\n")
+
+    # xref
+    xref_start = sum(len(o) for o in objects)
+    # compute real offsets (including header)
+    # rebuild xref offsets by scanning objects is complex; we used running offsets list
+    # Let's compute actual offsets by re-walking
+    full = b"".join(objects)
+    # But we need xref entries; easiest: compute by finding "1 0 obj" etc offsets
+    # We'll do a simple find
+    def find_offset(marker: bytes) -> int:
+        return full.find(marker)
+
+    off1 = find_offset(b"1 0 obj")
+    off2 = find_offset(b"2 0 obj")
+    off3 = find_offset(b"3 0 obj")
+    off4 = find_offset(b"4 0 obj")
+    off5 = find_offset(b"5 0 obj")
+
+    xref = "xref\n0 6\n0000000000 65535 f \n".encode("utf-8")
+    for off in [off1, off2, off3, off4, off5]:
+        xref += f"{off:010d} 00000 n \n".encode("utf-8")
+
+    trailer = f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode("utf-8")
+
+    return full + xref + trailer
+
+# ============================================================
+# TELAS + FLUXO
+# ============================================================
+
+INDEX_HTML = r"""
 <!DOCTYPE html>
-<html lang="pt-br">
+<html lang="pt-BR">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="manifest" href="/static/manifest.json" />
-  <meta name="theme-color" content="#4E633E" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arte Preço Pro</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#4E683E" />
   <link rel="icon" href="/static/icon-192.png" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
-  <title>Arte Preço Pro</title>
   <style>
     :root{
-      --bg: #DCE5D5;
-      --card: #E9EFE5;
-      --accent: #4E633E;
-      --accent2: #38512D;
-      --text: #111;
-      --muted: #3a3a3a;
-      --border: #b8c5b1;
-      --white: #fff;
+      --bg:#DCE6D5;
+      --card:#EAF1E6;
+      --dark:#4E683E;
+      --dark2:#3B5330;
+      --txt:#1a1a1a;
+      --muted:#444;
+      --radius:18px;
     }
-    body{ font-family: Arial, Helvetica, sans-serif; background: var(--bg); margin:0; padding:16px; color: var(--text); }
-    .wrap{ max-width: 560px; margin: 0 auto; }
-    .card{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; box-shadow: 0 2px 6px rgba(0,0,0,.06); }
-    h1{ margin:0 0 10px 0; font-size: 34px; letter-spacing: -0.5px; }
-    h2{ margin:14px 0 10px 0; font-size: 18px; }
-    label{ display:block; font-weight: 700; margin: 10px 0 6px; }
-    input, textarea{ width: 100%; padding: 12px; font-size: 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--white); box-sizing: border-box; }
-    .row{ display:flex; gap: 12px; }
-    .row > div{ flex:1; }
-    .btn{ background: var(--accent); color: #fff; font-weight: 800; border:0; border-radius: 12px; padding: 14px 14px; font-size: 18px; width: 100%; cursor:pointer; }
-    .btn:hover{ background: var(--accent2); }
-    .btn2{ background: #3a3a3a; color:#fff; font-weight:800; border:0; border-radius: 12px; padding: 12px 14px; font-size: 16px; width: 100%; cursor:pointer; }
-    .btn3{ background: var(--accent); color:#fff; font-weight:800; border:0; border-radius: 12px; padding: 12px 14px; font-size: 16px; width: 100%; cursor:pointer; }
-    .mt{ margin-top: 12px; }
-    .big{ font-size: 36px; font-weight: 900; margin: 6px 0 2px; }
-    .muted{ color: var(--muted); }
-    .warn{ background:#fff7e6; border:1px solid #ffd9a8; padding:10px; border-radius:12px; margin-top:10px; }
-    .ok{ background:#e9fff0; border:1px solid #b8f0c7; padding:10px; border-radius:12px; margin-top:10px; }
-    .mini{ font-size: 12px; color: var(--muted); }
-    .footer{ margin-top: 12px; display:flex; gap: 10px; }
-    .footer .btn2, .footer .btn3{ width: 50%; }
-    .hide{ display:none; }
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:var(--bg);
+      color:var(--txt);
+    }
+    .wrap{
+      max-width:760px;
+      margin:0 auto;
+      padding:18px;
+    }
+    .card{
+      background:var(--card);
+      border-radius:var(--radius);
+      padding:18px;
+      box-shadow:0 4px 16px rgba(0,0,0,.08);
+      margin-bottom:18px;
+    }
+    h1{
+      margin:0 0 10px 0;
+      font-size:28px;
+      letter-spacing:.3px;
+    }
+    h2{
+      margin:0 0 10px 0;
+      font-size:18px;
+      color:var(--dark2);
+    }
+    .row{
+      display:flex;
+      gap:12px;
+      flex-wrap:wrap;
+    }
+    .col{
+      flex:1;
+      min-width:220px;
+    }
+    label{
+      display:block;
+      font-weight:700;
+      margin:10px 0 6px;
+      color:var(--muted);
+    }
+    input{
+      width:100%;
+      box-sizing:border-box;
+      border:1px solid rgba(0,0,0,.12);
+      border-radius:14px;
+      padding:12px 12px;
+      font-size:16px;
+      outline:none;
+      background:#fff;
+    }
+    input:focus{
+      border-color:rgba(78,104,62,.45);
+      box-shadow:0 0 0 3px rgba(78,104,62,.15);
+    }
+    .btn{
+      width:100%;
+      border:0;
+      padding:14px 14px;
+      font-size:18px;
+      font-weight:800;
+      border-radius:14px;
+      cursor:pointer;
+      background:var(--dark);
+      color:#fff;
+      margin-top:14px;
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btn.secondary{
+      background:#6b6b6b;
+    }
+    .btn.outline{
+      background:transparent;
+      color:var(--dark);
+      border:2px solid var(--dark);
+    }
+    .small{
+      font-size:14px;
+      color:#333;
+      margin-top:6px;
+    }
+    .result{
+      margin-top:18px;
+      padding:14px;
+      background:#fff;
+      border-radius:16px;
+      border:1px solid rgba(0,0,0,.10);
+    }
+    .big{
+      font-size:34px;
+      font-weight:900;
+      color:#000;
+      margin-top:4px;
+    }
+    .muted{
+      color:#444;
+      font-size:15px;
+    }
+    .warn{
+      margin-top:10px;
+      color:#7a4b00;
+      font-weight:700;
+    }
+    .footer-actions{
+      display:flex;
+      gap:12px;
+      margin-top:14px;
+      flex-wrap:wrap;
+    }
+    .footer-actions .btn{
+      flex:1;
+      min-width:220px;
+      margin-top:0;
+    }
   </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card" id="box-ativacao">
-    <h1>Ativação do Arte Preço Pro</h1>
-    <div class="muted">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
-    <label>Chave</label>
-    <input id="licKey" placeholder="Cole sua chave AP-..." />
-    <button class="btn mt" onclick="ativar()">Ativar</button>
-    <div id="msgAtivar" class="warn hide"></div>
-  </div>
-
-  <div class="card hide" id="box-app">
-    <h1>Arte Preço Pro</h1>
-    <div class="muted">Preencha os dados e gere o orçamento em PDF.</div>
-
-    <h2>Dados da Empresa</h2>
-    <label>Nome</label>
-    <input id="emp_nome" placeholder="Ex: PJ Studio Design" />
-    <label>Telefone</label>
-    <input id="emp_tel" placeholder="Ex: (24) 99999-9999" />
-    <label>E-mail</label>
-    <input id="emp_email" placeholder="Ex: contato@empresa.com" />
-    <label>Endereço</label>
-    <input id="emp_end" placeholder="Ex: Rua..., nº..., Cidade" />
-
-    <h2>Dados do Cliente</h2>
-    <label>Nome</label>
-    <input id="cli_nome" placeholder="Ex: Nome do cliente" />
-    <label>Telefone</label>
-    <input id="cli_tel" placeholder="Ex: (24) 99999-9999" />
-    <label>E-mail</label>
-    <input id="cli_email" placeholder="Ex: cliente@email.com" />
-    <label>Endereço</label>
-    <input id="cli_end" placeholder="Ex: Rua..., nº..., Cidade" />
-
-    <h2>Detalhes do Serviço</h2>
-    <label>Produto/Serviço</label>
-    <input id="produto" placeholder="Ex: Logo" />
-    <label>Custo do Material (R$)</label>
-    <input id="custo_material" placeholder="Ex: 10" inputmode="decimal" />
-    <div class="row">
-      <div>
-        <label>Horas Trabalhadas</label>
-        <input id="horas" placeholder="Ex: 4" inputmode="decimal" />
-      </div>
-      <div>
-        <label>Valor da Hora (R$)</label>
-        <input id="valor_hora" placeholder="Ex: 30" inputmode="decimal" />
-      </div>
-    </div>
-    <label>Despesas Extras (R$)</label>
-    <input id="despesas" placeholder="Ex: 2" inputmode="decimal" />
-    <label>Margem de Lucro (%)</label>
-    <input id="margem" placeholder="Ex: 80" inputmode="decimal" />
-    <label>Validade (dias)</label>
-    <input id="validade" placeholder="Ex: 7" inputmode="numeric" />
-
-    <button class="btn mt" onclick="calcular()">Calcular</button>
-
-    <div id="resultado" class="ok hide">
-      <div><b>Produto:</b> <span id="r_prod"></span></div>
-      <div><b>Custo Base:</b> R$ <span id="r_base"></span></div>
-      <div class="big">Preço Final: R$ <span id="r_final"></span></div>
-      <div class="muted">Validade: <span id="r_val"></span> dia(s)</div>
-    </div>
-
-    <button class="btn3 mt hide" id="btnPdf" onclick="gerarPDF()">Gerar PDF</button>
-
-    <div class="footer mt">
-      <button class="btn2" onclick="sair()">Sair</button>
-      <button class="btn3" onclick="limparDados()">Limpar dados</button>
-    </div>
-
-    <div class="mini mt">
-      Dica: Para instalar, use o menu do Chrome → “Adicionar à tela inicial”.
-    </div>
-  </div>
-</div>
-
-<script>
-  // PWA: registra o Service Worker
-  if ("serviceWorker" in navigator) {
-    window.addEventListener("load", () => {
-      navigator.serviceWorker.register("/static/sw.js").catch(() => {});
-    });
-  }
-
-  function show(el){ el.classList.remove("hide"); }
-  function hide(el){ el.classList.add("hide"); }
-
-  function saveLocal(key, obj){
-    try{ localStorage.setItem(key, JSON.stringify(obj)); }catch(e){}
-  }
-  function loadLocal(key){
-    try{
-      const s = localStorage.getItem(key);
-      if(!s) return null;
-      return JSON.parse(s);
-    }catch(e){ return null; }
-  }
-  function delLocal(key){
-    try{ localStorage.removeItem(key); }catch(e){}
-  }
-
-  function setFields(prefix, data){
-    if(!data) return;
-    Object.keys(data).forEach(k=>{
-      const el = document.getElementById(prefix + "_" + k);
-      if(el) el.value = data[k] || "";
-    });
-  }
-
-  function getFields(prefix, keys){
-    const out = {};
-    keys.forEach(k=>{
-      const el = document.getElementById(prefix + "_" + k);
-      out[k] = el ? (el.value || "") : "";
-    });
-    return out;
-  }
-
-  async function postJSON(url, payload){
-    const res = await fetch(url, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify(payload)
-    });
-    return { ok: res.ok, status: res.status, data: await res.json().catch(()=>({})) };
-  }
-
-  async function ativar(){
-    const key = document.getElementById("licKey").value.trim();
-    const box = document.getElementById("msgAtivar");
-    hide(box);
-
-    if(!key){
-      box.textContent = "Cole a chave AP-... para ativar.";
-      show(box);
-      return;
-    }
-
-    const resp = await postJSON("/api/ativar", { key });
-    if(!resp.ok || !resp.data || !resp.data.ok){
-      box.textContent = (resp.data && resp.data.msg) ? resp.data.msg : "Falha ao ativar.";
-      show(box);
-      return;
-    }
-
-    // salva no localStorage para não pedir sempre
-    saveLocal("ap_key", { key });
-
-    // abre app
-    hide(document.getElementById("box-ativacao"));
-    show(document.getElementById("box-app"));
-    carregarPreferencias();
-  }
-
-  function carregarPreferencias(){
-    const emp = loadLocal("ap_emp");
-    const cli = loadLocal("ap_cli");
-    const last = loadLocal("ap_last");
-
-    setFields("emp", emp);
-    setFields("cli", cli);
-
-    if(last){
-      const map = {
-        produto: "produto",
-        custo_material: "custo_material",
-        horas: "horas",
-        valor_hora: "valor_hora",
-        despesas: "despesas",
-        margem: "margem",
-        validade: "validade",
-      };
-      Object.keys(map).forEach(k=>{
-        const el = document.getElementById(map[k]);
-        if(el && last[k] !== undefined) el.value = last[k];
+  <script>
+    // Registra o Service Worker (para instalação/offline)
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(()=>{});
       });
     }
-  }
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    {% if not activated %}
+      <div class="card">
+        <h1>Ativação do Arte Preço Pro</h1>
+        <div class="small">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
+        <form method="POST" action="/ativar">
+          <label>Chave</label>
+          <input name="chave" placeholder="Cole sua chave AP-..." required />
+          <button class="btn" type="submit">Ativar</button>
+        </form>
+        {% if msg %}
+          <div class="warn">{{msg}}</div>
+        {% endif %}
+      </div>
+    {% else %}
+      <div class="card">
+        <h1>Arte Preço Pro</h1>
+        <div class="small">Preencha e clique em <b>Calcular</b>. Depois gere o PDF.</div>
 
-  function persistirPreferencias(){
-    saveLocal("ap_emp", getFields("emp", ["nome","tel","email","end"]));
-    saveLocal("ap_cli", getFields("cli", ["nome","tel","email","end"]));
-    saveLocal("ap_last", {
-      produto: document.getElementById("produto").value,
-      custo_material: document.getElementById("custo_material").value,
-      horas: document.getElementById("horas").value,
-      valor_hora: document.getElementById("valor_hora").value,
-      despesas: document.getElementById("despesas").value,
-      margem: document.getElementById("margem").value,
-      validade: document.getElementById("validade").value,
-    });
-  }
+        <form method="POST" action="/calcular">
+          <label>Produto</label>
+          <input name="produto" value="{{form.produto}}" placeholder="Ex: Logo" required />
 
-  async function calcular(){
-    persistirPreferencias();
+          <label>Custo do Material (R$)</label>
+          <input name="custo_material" value="{{form.custo_material}}" placeholder="Ex: 10" inputmode="decimal" required />
 
-    const payload = {
-      produto: document.getElementById("produto").value.trim(),
-      custo_material: document.getElementById("custo_material").value,
-      horas: document.getElementById("horas").value,
-      valor_hora: document.getElementById("valor_hora").value,
-      despesas: document.getElementById("despesas").value,
-      margem: document.getElementById("margem").value,
-      validade: document.getElementById("validade").value,
-    };
+          <div class="row">
+            <div class="col">
+              <label>Horas Trabalhadas</label>
+              <input name="horas_trabalhadas" value="{{form.horas_trabalhadas}}" placeholder="Ex: 4" inputmode="decimal" required />
+            </div>
+            <div class="col">
+              <label>Valor da Hora (R$)</label>
+              <input name="valor_hora" value="{{form.valor_hora}}" placeholder="Ex: 30" inputmode="decimal" required />
+            </div>
+          </div>
 
-    const resp = await postJSON("/api/calcular", payload);
-    if(!resp.ok || !resp.data || !resp.data.ok){
-      alert((resp.data && resp.data.msg) ? resp.data.msg : "Erro ao calcular.");
-      return;
-    }
+          <label>Despesas Extras (R$)</label>
+          <input name="despesas_extras" value="{{form.despesas_extras}}" placeholder="Ex: 2" inputmode="decimal" required />
 
-    document.getElementById("r_prod").textContent = resp.data.produto || "";
-    document.getElementById("r_base").textContent = resp.data.custo_base_fmt || "0,00";
-    document.getElementById("r_final").textContent = resp.data.preco_final_fmt || "0,00";
-    document.getElementById("r_val").textContent = resp.data.validade || "0";
+          <label>Margem de Lucro (%)</label>
+          <input name="margem_lucro_pct" value="{{form.margem_lucro_pct}}" placeholder="Ex: 80" inputmode="decimal" required />
 
-    show(document.getElementById("resultado"));
-    show(document.getElementById("btnPdf"));
-  }
+          <label>Validade (dias)</label>
+          <input name="validade_dias" value="{{form.validade_dias}}" placeholder="Ex: 7" inputmode="numeric" required />
 
-  async function gerarPDF(){
-    persistirPreferencias();
+          <button class="btn" type="submit">Calcular</button>
+        </form>
 
-    const payload = {
-      empresa: getFields("emp", ["nome","tel","email","end"]),
-      cliente: getFields("cli", ["nome","tel","email","end"]),
-      produto: document.getElementById("produto").value.trim(),
-      custo_material: document.getElementById("custo_material").value,
-      horas: document.getElementById("horas").value,
-      valor_hora: document.getElementById("valor_hora").value,
-      despesas: document.getElementById("despesas").value,
-      // margem NÃO vai aparecer no PDF (você pediu remover)
-      margem: document.getElementById("margem").value,
-      validade: document.getElementById("validade").value,
-    };
+        {% if result %}
+          <div class="result">
+            <div><b>Produto:</b> {{result.produto}}</div>
+            <div><b>Custo Base:</b> {{result.custo_base_fmt}}</div>
+            <div class="big">Preço Final: {{result.preco_final_fmt}}</div>
+            <div class="muted">Validade: {{result.validade_dias}} dia(s)</div>
 
-    const res = await fetch("/api/pdf", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify(payload)
-    });
+            <div class="footer-actions">
+              <form method="GET" action="/pdf" style="flex:1;">
+                <button class="btn outline" type="submit">Gerar PDF</button>
+              </form>
 
-    if(!res.ok){
-      alert("Falha ao gerar PDF.");
-      return;
-    }
+              <form method="GET" action="/empresa" style="flex:1;">
+                <button class="btn outline" type="submit">Dados da empresa</button>
+              </form>
 
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    window.open(url, "_blank");
-  }
+              <form method="GET" action="/cliente" style="flex:1;">
+                <button class="btn outline" type="submit">Dados do cliente</button>
+              </form>
+            </div>
+          </div>
+        {% endif %}
+      </div>
 
-  function limparDados(){
-    if(!confirm("Deseja limpar dados salvos (empresa/cliente/orçamento)?")) return;
-    delLocal("ap_emp");
-    delLocal("ap_cli");
-    delLocal("ap_last");
-    // não apaga a chave
-    alert("Dados limpos.");
-  }
-
-  function sair(){
-    // volta para tela de ativação (mantém chave salva)
-    show(document.getElementById("box-ativacao"));
-    hide(document.getElementById("box-app"));
-  }
-
-  // auto-ativar se já tiver chave salva
-  (function(){
-    const k = loadLocal("ap_key");
-    if(k && k.key){
-      document.getElementById("licKey").value = k.key;
-      ativar();
-    }
-  })();
-</script>
+      <div class="card">
+        <div class="footer-actions">
+          <form method="POST" action="/sair" style="flex:1;">
+            <button class="btn secondary" type="submit">Sair</button>
+          </form>
+          <form method="POST" action="/revalidar" style="flex:1;">
+            <button class="btn" type="submit">Revalidar chave</button>
+          </form>
+        </div>
+      </div>
+    {% endif %}
+  </div>
 </body>
 </html>
 """
 
-# ==========================================
-#  ROUTES
-# ==========================================
-@app.get("/")
-def home():
-    return HTML
+# ============================================================
+# REGRAS DE CÁLCULO
+# ============================================================
 
+@dataclass
+class CalcInput:
+    produto: str
+    custo_material: float
+    horas_trabalhadas: float
+    valor_hora: float
+    despesas_extras: float
+    margem_lucro_pct: float
+    validade_dias: int
 
-@app.post("/api/ativar")
-def api_ativar():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        key = (data.get("key") or "").strip()
+@dataclass
+class CalcResult:
+    custo_base: float
+    preco_final: float
+    preco_final_fmt: str
+    custo_base_fmt: str
 
-        ok, msg = validar_chave(key)
-        if not ok:
-            return {"ok": False, "msg": msg}, 200
+def _fmt_brl(v: float) -> str:
+    s = f"{v:,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
 
-        # cria/garante device_id
-        did = _get_cookie(request, DEVICE_KEY) or _get_device_id(request)
+def calcular_preco(ci: CalcInput) -> CalcResult:
+    custo_trabalho = max(ci.horas_trabalhadas, 0) * max(ci.valor_hora, 0)
+    custo_base = max(ci.custo_material, 0) + max(ci.despesas_extras, 0) + custo_trabalho
+    mult = 1.0 + (max(ci.margem_lucro_pct, 0) / 100.0)
+    preco_final = custo_base * mult
+    return CalcResult(
+        custo_base=custo_base,
+        preco_final=preco_final,
+        preco_final_fmt=_fmt_brl(preco_final),
+        custo_base_fmt=_fmt_brl(custo_base),
+    )
 
-        resp = make_response({"ok": True, "msg": "Ativado"})
-        resp = _set_cookie(resp, DEVICE_KEY, did, 3650)
-        resp = _set_cookie(resp, COOKIE_KEY, key, 3650)
-        return resp
-    except Exception:
-        return {"ok": False, "msg": "Erro interno"}, 200
+# ============================================================
+# PDF (GERAÇÃO SIMPLES)
+# ============================================================
 
+def gerar_pdf_bytes(dados_empresa: dict, dados_cliente: dict, ci: CalcInput, cr: CalcResult) -> bytes:
+    # PDF simples via texto (sem lib externa) — funciona bem na Vercel
+    # Estrutura minimalista PDF (ok para uso)
+    # Observação: NÃO mostramos margem no PDF (como você pediu).
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-@app.post("/api/calcular")
-def api_calcular():
-    try:
-        # valida se tem chave no cookie/local (app manda pela ativação)
-        lic = _get_cookie(request, COOKIE_KEY)
-        if not lic:
-            return {"ok": False, "msg": "Chave não encontrada. Ative novamente."}, 200
+    empresa_nome = dados_empresa.get("nome", "").strip()
+    empresa_tel = dados_empresa.get("telefone", "").strip()
+    empresa_email = dados_empresa.get("email", "").strip()
+    empresa_end = dados_empresa.get("endereco", "").strip()
 
-        ok, msg = validar_chave(lic)
-        if not ok:
-            return {"ok": False, "msg": f"Chave inválida: {msg}"}, 200
+    cliente_nome = dados_cliente.get("nome", "").strip()
+    cliente_tel = dados_cliente.get("telefone", "").strip()
+    cliente_email = dados_cliente.get("email", "").strip()
+    cliente_end = dados_cliente.get("endereco", "").strip()
 
-        data = request.get_json(force=True, silent=True) or {}
+    lines = []
+    lines.append("ORCAMENTO - ARTE PRECO PRO")
+    lines.append("")
+    lines.append(f"Data: {now}")
+    lines.append("")
+    lines.append("DADOS DA EMPRESA")
+    lines.append(f"Nome: {empresa_nome}")
+    lines.append(f"Telefone: {empresa_tel}")
+    lines.append(f"E-mail: {empresa_email}")
+    lines.append(f"Endereço: {empresa_end}")
+    lines.append("")
+    lines.append("DADOS DO CLIENTE")
+    lines.append(f"Nome: {cliente_nome}")
+    lines.append(f"Telefone: {cliente_tel}")
+    lines.append(f"E-mail: {cliente_email}")
+    lines.append(f"Endereço: {cliente_end}")
+    lines.append("")
+    lines.append("DETALHES DO SERVIÇO")
+    lines.append(f"Produto/Serviço: {ci.produto}")
+    lines.append(f"Custo material: {_fmt_brl(ci.custo_material)}")
+    lines.append(f"Trabalho: {ci.horas_trabalhadas:g}h x {_fmt_brl(ci.valor_hora)}")
+    lines.append(f"Despesas extras: {_fmt_brl(ci.despesas_extras)}")
+    lines.append("")
+    lines.append(f"Custo Base: {cr.custo_base_fmt}")
+    lines.append(f"Preco Final: {cr.preco_final_fmt}")
+    lines.append(f"Validade: {ci.validade_dias} dia(s)")
+    text = "\n".join(lines)
 
-        produto = (data.get("produto") or "").strip()
-        custo_material = _safe_float(data.get("custo_material"), 0.0)
-        horas = _safe_float(data.get("horas"), 0.0)
-        valor_hora = _safe_float(data.get("valor_hora"), 0.0)
-        despesas = _safe_float(data.get("despesas"), 0.0)
-        margem = _safe_float(data.get("margem"), 0.0)
-        validade = _safe_int(data.get("validade"), 0)
+    # PDF básico (texto)
+    # monta um PDF simples com fonte padrão
+    def pdf_escape(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-        if not produto:
-            produto = "Serviço"
+    content_stream = "BT\n/F1 14 Tf\n50 760 Td\n"
+    y = 0
+    for line in text.split("\n"):
+        if y != 0:
+            content_stream += "0 -18 Td\n"
+        content_stream += f"({pdf_escape(line)}) Tj\n"
+        y += 1
+    content_stream += "ET\n"
+    content_bytes = content_stream.encode("latin-1", errors="ignore")
 
-        custo_base, preco_final = calcular_preco(
-            custo_material=custo_material,
-            horas=horas,
-            valor_hora=valor_hora,
-            despesas_extras=despesas,
-            margem_pct=margem,
-        )
+    objects = []
+    offsets = []
 
-        return {
-            "ok": True,
-            "produto": produto,
-            "custo_base": custo_base,
-            "preco_final": preco_final,
-            "custo_base_fmt": _fmt_money(custo_base),
-            "preco_final_fmt": _fmt_money(preco_final),
-            "validade": validade,
-        }, 200
-    except TypeError as e:
-        # quando algum argumento muda (proteção)
-        return {"ok": False, "msg": f"Erro de parâmetros no cálculo: {e}"}, 200
-    except Exception:
-        return {"ok": False, "msg": "Erro interno ao calcular"}, 200
+    def add_obj(s: bytes):
+        offsets.append(sum(len(o) for o in objects))
+        objects.append(s)
 
+    # PDF header
+    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    objects.append(header)
 
-@app.post("/api/pdf")
-def api_pdf():
-    """
-    Gera um PDF simples em HTML->PDF via navegador (blob).
-    Aqui retornamos um PDF básico (bytes) para download/abertura.
-    """
-    try:
-        lic = _get_cookie(request, COOKIE_KEY)
-        if not lic:
-            return {"ok": False, "msg": "Chave não encontrada. Ative novamente."}, 200
+    # 1) catalog
+    add_obj(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    # 2) pages
+    add_obj(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    # 3) page
+    add_obj(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n")
+    # 4) font
+    add_obj(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+    # 5) contents
+    add_obj(f"5 0 obj\n<< /Length {len(content_bytes)} >>\nstream\n".encode("utf-8") + content_bytes + b"\nendstream\nendobj\n")
 
-        ok, msg = validar_chave(lic)
-        if not ok:
-            return {"ok": False, "msg": f"Chave inválida: {msg}"}, 200
+    # xref
+    xref_start = sum(len(o) for o in objects)
+    # compute real offsets (including header)
+    # rebuild xref offsets by scanning objects is complex; we used running offsets list
+    # Let's compute actual offsets by re-walking
+    full = b"".join(objects)
+    # But we need xref entries; easiest: compute by finding "1 0 obj" etc offsets
+    # We'll do a simple find
+    def find_offset(marker: bytes) -> int:
+        return full.find(marker)
 
-        data = request.get_json(force=True, silent=True) or {}
+    off1 = find_offset(b"1 0 obj")
+    off2 = find_offset(b"2 0 obj")
+    off3 = find_offset(b"3 0 obj")
+    off4 = find_offset(b"4 0 obj")
+    off5 = find_offset(b"5 0 obj")
 
-        empresa = data.get("empresa") or {}
-        cliente = data.get("cliente") or {}
+    xref = "xref\n0 6\n0000000000 65535 f \n".encode("utf-8")
+    for off in [off1, off2, off3, off4, off5]:
+        xref += f"{off:010d} 00000 n \n".encode("utf-8")
 
-        produto = (data.get("produto") or "").strip() or "Serviço"
-        custo_material = _safe_float(data.get("custo_material"), 0.0)
-        horas = _safe_float(data.get("horas"), 0.0)
-        valor_hora = _safe_float(data.get("valor_hora"), 0.0)
-        despesas = _safe_float(data.get("despesas"), 0.0)
-        margem = _safe_float(data.get("margem"), 0.0)
-        validade = _safe_int(data.get("validade"), 0)
+    trailer = f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode("utf-8")
 
-        custo_base, preco_final = calcular_preco(
-            custo_material=custo_material,
-            horas=horas,
-            valor_hora=valor_hora,
-            despesas_extras=despesas,
-            margem_pct=margem,
-        )
+    return full + xref + trailer
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # IMPORTANTE: você pediu REMOVER a margem do PDF.
-        # Então NÃO mostramos margem no PDF.
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# ============================================================
+# TELAS + FLUXO
+# ============================================================
 
-        html_pdf = f"""
-        <html>
-        <head>
-          <meta charset="utf-8">
-          <style>
-            body {{ font-family: Arial, Helvetica, sans-serif; }}
-            h1 {{ margin:0 0 10px 0; }}
-            .sec {{ margin-top: 12px; }}
-            .big {{ font-size: 28px; font-weight: 900; margin-top: 10px; }}
-            .muted {{ color:#444; }}
-          </style>
-        </head>
-        <body>
-          <h1>ORÇAMENTO - ARTE PREÇO PRO</h1>
-          <div class="muted">Data: {_now_fmt()}</div>
+INDEX_HTML = r"""
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arte Preço Pro</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#4E683E" />
+  <link rel="icon" href="/static/icon-192.png" />
+  <link rel="apple-touch-icon" href="/static/icon-192.png" />
+  <style>
+    :root{
+      --bg:#DCE6D5;
+      --card:#EAF1E6;
+      --dark:#4E683E;
+      --dark2:#3B5330;
+      --txt:#1a1a1a;
+      --muted:#444;
+      --radius:18px;
+    }
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:var(--bg);
+      color:var(--txt);
+    }
+    .wrap{
+      max-width:760px;
+      margin:0 auto;
+      padding:18px;
+    }
+    .card{
+      background:var(--card);
+      border-radius:var(--radius);
+      padding:18px;
+      box-shadow:0 4px 16px rgba(0,0,0,.08);
+      margin-bottom:18px;
+    }
+    h1{
+      margin:0 0 10px 0;
+      font-size:28px;
+      letter-spacing:.3px;
+    }
+    h2{
+      margin:0 0 10px 0;
+      font-size:18px;
+      color:var(--dark2);
+    }
+    .row{
+      display:flex;
+      gap:12px;
+      flex-wrap:wrap;
+    }
+    .col{
+      flex:1;
+      min-width:220px;
+    }
+    label{
+      display:block;
+      font-weight:700;
+      margin:10px 0 6px;
+      color:var(--muted);
+    }
+    input{
+      width:100%;
+      box-sizing:border-box;
+      border:1px solid rgba(0,0,0,.12);
+      border-radius:14px;
+      padding:12px 12px;
+      font-size:16px;
+      outline:none;
+      background:#fff;
+    }
+    input:focus{
+      border-color:rgba(78,104,62,.45);
+      box-shadow:0 0 0 3px rgba(78,104,62,.15);
+    }
+    .btn{
+      width:100%;
+      border:0;
+      padding:14px 14px;
+      font-size:18px;
+      font-weight:800;
+      border-radius:14px;
+      cursor:pointer;
+      background:var(--dark);
+      color:#fff;
+      margin-top:14px;
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btn.secondary{
+      background:#6b6b6b;
+    }
+    .btn.outline{
+      background:transparent;
+      color:var(--dark);
+      border:2px solid var(--dark);
+    }
+    .small{
+      font-size:14px;
+      color:#333;
+      margin-top:6px;
+    }
+    .result{
+      margin-top:18px;
+      padding:14px;
+      background:#fff;
+      border-radius:16px;
+      border:1px solid rgba(0,0,0,.10);
+    }
+    .big{
+      font-size:34px;
+      font-weight:900;
+      color:#000;
+      margin-top:4px;
+    }
+    .muted{
+      color:#444;
+      font-size:15px;
+    }
+    .warn{
+      margin-top:10px;
+      color:#7a4b00;
+      font-weight:700;
+    }
+    .footer-actions{
+      display:flex;
+      gap:12px;
+      margin-top:14px;
+      flex-wrap:wrap;
+    }
+    .footer-actions .btn{
+      flex:1;
+      min-width:220px;
+      margin-top:0;
+    }
+  </style>
+  <script>
+    // Registra o Service Worker (para instalação/offline)
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(()=>{});
+      });
+    }
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    {% if not activated %}
+      <div class="card">
+        <h1>Ativação do Arte Preço Pro</h1>
+        <div class="small">Cole a chave AP-... (uma vez). O app lembra automaticamente.</div>
+        <form method="POST" action="/ativar">
+          <label>Chave</label>
+          <input name="chave" placeholder="Cole sua chave AP-..." required />
+          <button class="btn" type="submit">Ativar</button>
+        </form>
+        {% if msg %}
+          <div class="warn">{{msg}}</div>
+        {% endif %}
+      </div>
+    {% else %}
+      <div class="card">
+        <h1>Arte Preço Pro</h1>
+        <div class="small">Preencha e clique em <b>Calcular</b>. Depois gere o PDF.</div>
 
-          <div class="sec">
-            <h3>DADOS DA EMPRESA</h3>
-            <div>Nome: {empresa.get("nome","")}</div>
-            <div>Telefone: {empresa.get("tel","")}</div>
-            <div>E-mail: {empresa.get("email","")}</div>
-            <div>Endereço: {empresa.get("end","")}</div>
+        <form method="POST" action="/calcular">
+          <label>Produto</label>
+          <input name="produto" value="{{form.produto}}" placeholder="Ex: Logo" required />
+
+          <label>Custo do Material (R$)</label>
+          <input name="custo_material" value="{{form.custo_material}}" placeholder="Ex: 10" inputmode="decimal" required />
+
+          <div class="row">
+            <div class="col">
+              <label>Horas Trabalhadas</label>
+              <input name="horas_trabalhadas" value="{{form.horas_trabalhadas}}" placeholder="Ex: 4" inputmode="decimal" required />
+            </div>
+            <div class="col">
+              <label>Valor da Hora (R$)</label>
+              <input name="valor_hora" value="{{form.valor_hora}}" placeholder="Ex: 30" inputmode="decimal" required />
+            </div>
           </div>
 
-          <div class="sec">
-            <h3>DADOS DO CLIENTE</h3>
-            <div>Nome: {cliente.get("nome","")}</div>
-            <div>Telefone: {cliente.get("tel","")}</div>
-            <div>E-mail: {cliente.get("email","")}</div>
-            <div>Endereço: {cliente.get("end","")}</div>
+          <label>Despesas Extras (R$)</label>
+          <input name="despesas_extras" value="{{form.despesas_extras}}" placeholder="Ex: 2" inputmode="decimal" required />
+
+          <label>Margem de Lucro (%)</label>
+          <input name="margem_lucro_pct" value="{{form.margem_lucro_pct}}" placeholder="Ex: 80" inputmode="decimal" required />
+
+          <label>Validade (dias)</label>
+          <input name="validade_dias" value="{{form.validade_dias}}" placeholder="Ex: 7" inputmode="numeric" required />
+
+          <button class="btn" type="submit">Calcular</button>
+        </form>
+
+        {% if result %}
+          <div class="result">
+            <div><b>Produto:</b> {{result.produto}}</div>
+            <div><b>Custo Base:</b> {{result.custo_base_fmt}}</div>
+            <div class="big">Preço Final: {{result.preco_final_fmt}}</div>
+            <div class="muted">Validade: {{result.validade_dias}} dia(s)</div>
+
+            <div class="footer-actions">
+              <form method="GET" action="/pdf" style="flex:1;">
+                <button class="btn outline" type="submit">Gerar PDF</button>
+              </form>
+
+              <form method="GET" action="/empresa" style="flex:1;">
+                <button class="btn outline" type="submit">Dados da empresa</button>
+              </form>
+
+              <form method="GET" action="/cliente" style="flex:1;">
+                <button class="btn outline" type="submit">Dados do cliente</button>
+              </form>
+            </div>
           </div>
+        {% endif %}
+      </div>
 
-          <div class="sec">
-            <h3>DETALHES DO SERVIÇO</h3>
-            <div>Produto/Serviço: {produto}</div>
-            <div>Custo material: R$ {_fmt_money(custo_material)}</div>
-            <div>Trabalho: {horas:g}h x R$ {_fmt_money(valor_hora)}</div>
-            <div>Despesas extras: R$ {_fmt_money(despesas)}</div>
-
-            <div class="big">Custo Base: R$ {_fmt_money(custo_base)}</div>
-            <div class="big">Preço Final: R$ {_fmt_money(preco_final)}</div>
-            <div class="muted">Validade: {validade} dia(s)</div>
-          </div>
-        </body>
-        </html>
-        """
-
-        # Gera PDF com reportlab (server-side)
-        try:
-            from reportlab.pdfgen import canvas
-            from reportlab.lib.pagesizes import A4
-            from reportlab.lib.units import mm
-
-            from io import BytesIO
-
-            buffer = BytesIO()
-            c = canvas.Canvas(buffer, pagesize=A4)
-            w, h = A4
-
-            y = h - 20 * mm
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(20 * mm, y, "ORÇAMENTO - ARTE PREÇO PRO")
-            y -= 8 * mm
-            c.setFont("Helvetica", 10)
-            c.drawString(20 * mm, y, f"Data: {_now_fmt()}")
-
-            y -= 12 * mm
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(20 * mm, y, "DADOS DA EMPRESA")
-            y -= 6 * mm
-            c.setFont("Helvetica", 10)
-            c.drawString(20 * mm, y, f"Nome: {empresa.get('nome','')}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Telefone: {empresa.get('tel','')}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"E-mail: {empresa.get('email','')}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Endereço: {empresa.get('end','')}")
-
-            y -= 10 * mm
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(20 * mm, y, "DADOS DO CLIENTE")
-            y -= 6 * mm
-            c.setFont("Helvetica", 10)
-            c.drawString(20 * mm, y, f"Nome: {cliente.get('nome','')}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Telefone: {cliente.get('tel','')}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"E-mail: {cliente.get('email','')}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Endereço: {cliente.get('end','')}")
-
-            y -= 10 * mm
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(20 * mm, y, "DETALHES DO SERVIÇO")
-            y -= 6 * mm
-            c.setFont("Helvetica", 10)
-            c.drawString(20 * mm, y, f"Produto/Serviço: {produto}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Custo material: R$ {_fmt_money(custo_material)}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Trabalho: {horas:g}h x R$ {_fmt_money(valor_hora)}")
-            y -= 5 * mm
-            c.drawString(20 * mm, y, f"Despesas extras: R$ {_fmt_money(despesas)}")
-
-            y -= 10 * mm
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(20 * mm, y, f"Custo Base: R$ {_fmt_money(custo_base)}")
-            y -= 10 * mm
-            c.drawString(20 * mm, y, f"Preço Final: R$ {_fmt_money(preco_final)}")
-
-            y -= 10 * mm
-            c.setFont("Helvetica", 10)
-            c.drawString(20 * mm, y, f"Validade: {validade} dia(s)")
-
-            c.showPage()
-            c.save()
-
-            pdf_bytes = buffer.getvalue()
-            buffer.close()
-
-            resp = make_response(pdf_bytes)
-            resp.headers["Content-Type"] = "application/pdf"
-            resp.headers["Content-Disposition"] = 'inline; filename="orcamento_arte_preco_pro.pdf"'
-            return resp
-        except Exception:
-            # fallback: retorna HTML (o navegador pode imprimir em PDF)
-            resp = make_response(html_pdf)
-            resp.headers["Content-Type"] = "text/html; charset=utf-8"
-            return resp
-
-    except Exception:
-        return {"ok": False, "msg": "Erro interno ao gerar PDF"}, 200
-
-# ==========================================
-#  VERCEL ENTRYPOINT
-# ==========================================
-# Vercel usa `app` automaticamente ao importar o módulo.
-# Não coloque app.run() aqui.
-# ==========================================
-
-
-# (Opcional) healthcheck
-@app.get("/health")
-def health():
-    return {"ok": True, "app": APP_NAME}, 200
+      <div class="card">
+        <div class="footer-actions">
+          <form method="POST" action="/sair" style="flex:1;">
+            <button class="btn secondary" type="submit">Sair</button>
+          </form>
+          <form method="POST" action="/revalidar" style="flex:1;">
+            <button class="btn" type="submit">Revalidar chave</button>
+          </form>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
